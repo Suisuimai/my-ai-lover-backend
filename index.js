@@ -37,10 +37,43 @@ app.post("/chat", async (req, res) => {
   });
 
   // 目前先返回测试内容
+  try {
+  const response = await fetch("https://api.deepseek.com/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: model,
+      messages: [
+        {
+          role: "user",
+          content: message
+        }
+      ]
+    })
+  });
+
+  const data = await response.json();
+
+  console.log(data);
+
   res.json({
     success: true,
-    reply: `你好，我收到了你的消息："${message}"`
+    reply: data.choices[0].message.content
   });
+
+} catch (err) {
+
+  console.error(err);
+
+  res.status(500).json({
+    success: false,
+    reply: "DeepSeek 调用失败"
+  });
+
+}
 
 });
 
