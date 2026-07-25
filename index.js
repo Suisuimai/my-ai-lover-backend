@@ -23,6 +23,7 @@ const DEFAULT_SETTINGS = {
 };
 const DEFAULT_SESSION_NAME = "New conversation";
 
+
 const MODEL_PROVIDERS = [
   {
     name: "deepseek",
@@ -47,11 +48,20 @@ const MODEL_PROVIDERS = [
   },
 ];
 
-const allowedOrigins = process.env.FRONTEND_ORIGIN
-  ? process.env.FRONTEND_ORIGIN.split(",").map((origin) => origin.trim())
-  : true;
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
-app.use(cors({ origin: allowedOrigins }));
+app.use(cors({
+  origin(origin, callback) {
+    const isAllowed = !origin
+      || origin.endsWith(".vercel.app")
+      || origin.startsWith("http://localhost:")
+      || allowedOrigins.includes(origin);
+    callback(isAllowed ? null : new Error("Origin is not allowed by CORS"), isAllowed);
+  },
+}));
 app.use(express.json());
 
 function toSettings(settings) {
