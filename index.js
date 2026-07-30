@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
 
 require("dotenv").config();
@@ -22,6 +23,21 @@ const DEFAULT_SETTINGS = {
   summary_model: "deepseek-v4-flash",
 };
 const DEFAULT_SESSION_NAME = "New conversation";
+
+function encryptionKey() {
+  const key = Buffer.from(process.env.SETTINGS_ENCRYPTION_KEY || "", "base64");
+  if (key.length !== 32) throw new Error("SETTINGS_ENCRYPTION_KEY must be a base64-encoded 32-byte key");
+  return key;
+}
+function encryptSecret(value) {
+  const iv = crypto.randomBytes(12); const cipher = crypto.createCipheriv("aes-256-gcm", encryptionKey(), iv);
+  const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString("base64");
+}
+function decryptSecret(value) {
+  const payload = Buffer.from(value, "base64"); const decipher = crypto.createDecipheriv("aes-256-gcm", encryptionKey(), payload.subarray(0, 12));
+  decipher.setAuthTag(payload.subarray(12, 28)); return Buffer.concat([decipher.update(payload.subarray(28)), decipher.final()]).toString("utf8");
+}
 
 
 const MODEL_PROVIDERS = [
@@ -64,6 +80,17 @@ app.use(cors({
 }));
 app.use(express.json());
 
+async function requireUser(req, res, next) {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  if (!token) return res.status(401).json({ error: "Authentication required" });
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data.user) return res.status(401).json({ error: "Invalid or expired session" });
+  req.user = data.user;
+  next();
+}
+
+app.use((req, res, next) => req.path === "/health" ? next() : requireUser(req, res, next));
+
 function toSettings(settings) {
   return {
     systemPrompt: settings.system_prompt,
@@ -90,14 +117,16 @@ function buildModelContext({ systemPrompt, memorySummary, recentMessages }) {
 function getModelProvider(model) {
   const provider = MODEL_PROVIDERS.find((item) => item.matches(model));
   if (!provider) throw new Error(`Unsupported model: ${model}`);
-
-  const apiKey = provider.apiKey();
-  if (!apiKey) throw new Error(`${provider.name} API key is not configured on the server`);
-  return { ...provider, apiKey };
+  return { ...provider, apiKey: provider.apiKey() };
 }
 
-async function callModel({ model, messages, temperature, maxTokens }) {
+async function callModel({ model, messages, temperature, maxTokens, userId }) {
   const provider = getModelProvider(model);
+  if (userId) {
+    const { data: credential } = await supabase.from("model_credentials").select("encrypted_key").eq("user_id", userId).eq("provider", provider.name).maybeSingle();
+    if (credential?.encrypted_key) provider.apiKey = decryptSecret(credential.encrypted_key);
+  }
+  if (!provider.apiKey) throw new Error(`${provider.name} API key is not configured. Add it in Settings.`);
   let response;
 
   if (provider.type === "openai-compatible") {
@@ -158,7 +187,7 @@ function normalizeRecentMessageLimit(limit) {
   return safeLimit % 2 === 0 ? safeLimit : safeLimit + 1;
 }
 
-async function maybeCompressMemory(sessionId, settings) {
+async function maybeCompressMemory(sessionId, settings, userId) {
   const { data: memory, error: memoryError } = await supabase
     .from("session_memories")
     .select("summary, last_compressed_at")
@@ -199,6 +228,7 @@ async function maybeCompressMemory(sessionId, settings) {
     model: settings.summary_model,
     temperature: 0.2,
     maxTokens: 500,
+    userId,
     messages: [{
       role: "system",
       content: "Maintain a compact factual memory for an AI companion. Preserve user preferences, important events, relationship context, commitments, and unresolved topics. Do not invent details.",
@@ -222,19 +252,19 @@ async function maybeCompressMemory(sessionId, settings) {
   return summary;
 }
 
-async function getSettings() {
+async function getSettings(userId) {
   const { data, error } = await supabase
-    .from("app_settings")
+    .from("user_settings")
     .select("*")
-    .eq("id", 1)
+    .eq("user_id", userId)
     .maybeSingle();
 
   if (error) throw error;
   if (data) return data;
 
   const { data: created, error: createError } = await supabase
-    .from("app_settings")
-    .upsert({ id: 1, ...DEFAULT_SETTINGS })
+    .from("user_settings")
+    .upsert({ user_id: userId, ...DEFAULT_SETTINGS }, { onConflict: "user_id" })
     .select()
     .single();
 
@@ -242,10 +272,10 @@ async function getSettings() {
   return created;
 }
 
-async function createSession(name = DEFAULT_SESSION_NAME) {
+async function createSession(userId, name = DEFAULT_SESSION_NAME) {
   const { data, error } = await supabase
     .from("sessions")
-    .insert({ name })
+    .insert({ name, user_id: userId })
     .select("id, name, created_at, updated_at")
     .single();
 
@@ -253,16 +283,23 @@ async function createSession(name = DEFAULT_SESSION_NAME) {
   return data;
 }
 
-async function touchSession(sessionId) {
+async function touchSession(sessionId, userId) {
   const { error } = await supabase
     .from("sessions")
     .update({ updated_at: new Date().toISOString() })
-    .eq("id", sessionId);
+    .eq("id", sessionId)
+    .eq("user_id", userId);
 
   if (error) throw error;
 }
 
-async function createTitle(model, message, reply) {
+async function requireOwnedSession(sessionId, userId) {
+  const { data, error } = await supabase.from("sessions").select("id").eq("id", sessionId).eq("user_id", userId).maybeSingle();
+  if (error) throw error;
+  if (!data) { const missing = new Error("Session not found"); missing.status = 404; throw missing; }
+}
+
+async function createTitle(model, message, reply, userId) {
   const fallback = message.slice(0, 16);
 
   try {
@@ -270,6 +307,7 @@ async function createTitle(model, message, reply) {
       model,
       temperature: 0.3,
       maxTokens: 20,
+      userId,
       messages: [{
         role: "user",
         content: `Create a concise title for this conversation. Return only the title, with no quotes, in at most 12 words.\nUser: ${message}\nAssistant: ${reply}`,
@@ -290,6 +328,7 @@ app.get("/sessions", async (req, res) => {
   const { data, error } = await supabase
     .from("sessions")
     .select("id, name, created_at, updated_at")
+    .eq("user_id", req.user.id)
     .order("updated_at", { ascending: false });
 
   if (error) return res.status(500).json({ success: false, error: error.message });
@@ -300,7 +339,7 @@ app.post("/sessions", async (req, res) => {
   const name = typeof req.body.name === "string" ? req.body.name.trim().slice(0, 48) : "";
 
   try {
-    const session = await createSession(name || DEFAULT_SESSION_NAME);
+    const session = await createSession(req.user.id, name || DEFAULT_SESSION_NAME);
     res.status(201).json({ success: true, session });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -315,6 +354,7 @@ app.patch("/sessions/:sessionId", async (req, res) => {
     .from("sessions")
     .update({ name, updated_at: new Date().toISOString() })
     .eq("id", req.params.sessionId)
+    .eq("user_id", req.user.id)
     .select("id, name, created_at, updated_at")
     .maybeSingle();
 
@@ -325,6 +365,8 @@ app.patch("/sessions/:sessionId", async (req, res) => {
 
 app.delete("/sessions/:sessionId", async (req, res) => {
   const sessionId = req.params.sessionId;
+
+  try { await requireOwnedSession(sessionId, req.user.id); } catch (error) { return res.status(error.status || 500).json({ error: error.message }); }
 
   const { error: messagesError } = await supabase
     .from("messages")
@@ -348,7 +390,8 @@ app.delete("/sessions/:sessionId", async (req, res) => {
 });
 
 // Message reads and writes. The legacy /messages/:sessionId route remains supported.
-async function readVisibleMessages(sessionId) {
+async function readVisibleMessages(sessionId, userId) {
+  await requireOwnedSession(sessionId, userId);
   const { data, error } = await supabase
     .from("messages")
     .select("id, session_id, role, content, is_visible, created_at")
@@ -362,7 +405,7 @@ async function readVisibleMessages(sessionId) {
 
 async function sendMessages(req, res) {
   try {
-    const messages = await readVisibleMessages(req.params.sessionId);
+    const messages = await readVisibleMessages(req.params.sessionId, req.user.id);
     res.json(messages);
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -378,6 +421,7 @@ app.post("/sessions/:sessionId/messages", async (req, res) => {
     return res.status(400).json({ success: false, error: "role and content are required" });
   }
 
+  try { await requireOwnedSession(req.params.sessionId, req.user.id); } catch (error) { return res.status(error.status || 500).json({ error: error.message }); }
   const { data, error } = await supabase
     .from("messages")
     .insert({ session_id: req.params.sessionId, role, content: content.trim(), is_visible: true })
@@ -387,7 +431,7 @@ app.post("/sessions/:sessionId/messages", async (req, res) => {
   if (error) return res.status(500).json({ success: false, error: error.message });
 
   try {
-    await touchSession(req.params.sessionId);
+    await touchSession(req.params.sessionId, req.user.id);
   } catch (touchError) {
     console.error("Session timestamp update failed:", touchError);
   }
@@ -398,7 +442,7 @@ app.post("/sessions/:sessionId/messages", async (req, res) => {
 // Settings
 app.get("/settings", async (req, res) => {
   try {
-    res.json({ success: true, settings: toSettings(await getSettings()) });
+    res.json({ success: true, settings: toSettings(await getSettings(req.user.id)) });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -425,16 +469,68 @@ app.patch("/settings", async (req, res) => {
   }
 
   try {
-    await getSettings();
+    await getSettings(req.user.id);
     const { data, error } = await supabase
-      .from("app_settings")
+      .from("user_settings")
       .update(updates)
-      .eq("id", 1)
+      .eq("user_id", req.user.id)
       .select()
       .single();
 
     if (error) throw error;
     res.json({ success: true, settings: toSettings(data) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/settings/credentials", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("model_credentials")
+      .select("provider, updated_at")
+      .eq("user_id", req.user.id);
+    if (error) throw error;
+    const configured = Object.fromEntries(MODEL_PROVIDERS.map(({ name }) => [name, false]));
+    data.forEach(({ provider, updated_at }) => { configured[provider] = { configured: true, updatedAt: updated_at }; });
+    res.json({ success: true, credentials: configured });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put("/settings/credentials/:provider", async (req, res) => {
+  const provider = req.params.provider;
+  const apiKey = typeof req.body.apiKey === "string" ? req.body.apiKey.trim() : "";
+  if (!MODEL_PROVIDERS.some((item) => item.name === provider)) {
+    return res.status(400).json({ success: false, error: "Unsupported model provider" });
+  }
+  if (!apiKey) return res.status(400).json({ success: false, error: "An API key is required" });
+
+  try {
+    const { error } = await supabase.from("model_credentials").upsert({
+      user_id: req.user.id,
+      provider,
+      encrypted_key: encryptSecret(apiKey),
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "user_id,provider" });
+    if (error) throw error;
+    res.json({ success: true, provider, configured: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete("/settings/credentials/:provider", async (req, res) => {
+  const provider = req.params.provider;
+  if (!MODEL_PROVIDERS.some((item) => item.name === provider)) {
+    return res.status(400).json({ success: false, error: "Unsupported model provider" });
+  }
+  try {
+    const { error } = await supabase.from("model_credentials").delete()
+      .eq("user_id", req.user.id).eq("provider", provider);
+    if (error) throw error;
+    res.json({ success: true, provider, configured: false });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -450,9 +546,12 @@ app.post("/chat", async (req, res) => {
     let isNewSession = false;
 
     if (!sessionId) {
-      const session = await createSession(DEFAULT_SESSION_NAME);
+      const session = await createSession(req.user.id, DEFAULT_SESSION_NAME);
       sessionId = session.id;
       isNewSession = true;
+    }
+    else {
+      await requireOwnedSession(sessionId, req.user.id);
     }
 
     const { error: userMessageError } = await supabase
@@ -460,10 +559,10 @@ app.post("/chat", async (req, res) => {
       .insert({ session_id: sessionId, role: "user", content: message, is_visible: true });
     if (userMessageError) throw userMessageError;
 
-    const settings = await getSettings();
+    const settings = await getSettings(req.user.id);
     let memorySummary;
     try {
-      memorySummary = await maybeCompressMemory(sessionId, settings);
+      memorySummary = await maybeCompressMemory(sessionId, settings, req.user.id);
     } catch (compressionError) {
       // A temporary compression failure must not prevent the companion from replying.
       console.error("Memory compression failed:", compressionError);
@@ -499,6 +598,7 @@ app.post("/chat", async (req, res) => {
       temperature: settings.temperature,
       maxTokens: settings.max_tokens,
       messages: context,
+      userId: req.user.id,
     });
 
     const { data: assistantMessage, error: assistantMessageError } = await supabase
@@ -510,14 +610,14 @@ app.post("/chat", async (req, res) => {
 
     let title;
     if (isNewSession) {
-      title = await createTitle(requestedModel, message, reply);
+      title = await createTitle(requestedModel, message, reply, req.user.id);
       const { error: titleError } = await supabase
         .from("sessions")
         .update({ name: title, updated_at: new Date().toISOString() })
         .eq("id", sessionId);
       if (titleError) console.error("Session title update failed:", titleError);
     } else {
-      await touchSession(sessionId);
+      await touchSession(sessionId, req.user.id);
     }
 
     res.json({ success: true, sessionId, title, reply, messageId: assistantMessage.id });
