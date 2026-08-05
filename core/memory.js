@@ -30,13 +30,26 @@ const COMMON_CHINESE_BIGRAMS = new Set([
   "可以", "已经", "还是", "就是", "用户", "希望", "自己",
 ]);
 
+const RECALL_CONCEPTS = [
+  {
+    name: "weekend",
+    aliases: ["周末", "周六", "星期六", "礼拜六", "周日", "星期日", "星期天", "礼拜日", "礼拜天"],
+  },
+];
+
 function recallTerms(value) {
   const text = normalizeTrigger(value).normalize("NFKC");
+  const compactText = normalizeForRecall(text);
   const terms = new Set(text.match(/[a-z0-9]{2,}/g) || []);
   for (const sequence of text.match(/[\p{Script=Han}]+/gu) || []) {
     for (let index = 0; index < sequence.length - 1; index += 1) {
       const bigram = sequence.slice(index, index + 2);
       if (!COMMON_CHINESE_BIGRAMS.has(bigram)) terms.add(bigram);
+    }
+  }
+  for (const concept of RECALL_CONCEPTS) {
+    if (concept.aliases.some((alias) => compactText.includes(normalizeForRecall(alias)))) {
+      terms.add(`concept:${concept.name}`);
     }
   }
   return terms;

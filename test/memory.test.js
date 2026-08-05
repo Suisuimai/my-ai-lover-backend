@@ -56,3 +56,17 @@ test("rankMemories supports partial Chinese trigger and content overlap", () => 
   assert.equal(rankMemories(memories, "周末那个面试安排怎么样了")[0].id, "lighthouse");
   assert.deepEqual(rankMemories(memories, "今天晚饭吃什么"), []);
 });
+
+test("rankMemories maps common Chinese weekend expressions to one concept", () => {
+  const memories = [{
+    id: "sunday-plan",
+    status: "active",
+    triggers: ["周日"],
+    content: "周日有一项重要安排。",
+    updated_at: "2026-08-05T00:00:00Z",
+  }];
+
+  assert.equal(rankMemories(memories, "周末有什么安排？")[0].id, "sunday-plan");
+  assert.equal(rankMemories(memories, "星期天要做什么？")[0].id, "sunday-plan");
+  assert.deepEqual(rankMemories(memories, "下周一有什么安排？"), []);
+});
