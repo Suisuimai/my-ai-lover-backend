@@ -61,6 +61,28 @@ function overlapCount(left, right) {
   return count;
 }
 
+function parseExplicitMemoryRequest(message) {
+  const text = String(message || "").trim();
+  const marker = /(?:请(?:你)?记住|帮我记住|记住|别忘了|不要忘记|请牢记)[：:，,\s]*(.+)$/su.exec(text);
+  if (!marker) return null;
+
+  const content = marker[1].trim().replace(/^[“”"'《》]+|[“”"'《》]+$/gu, "").slice(0, 1200);
+  if (content.length < 2) return null;
+
+  const quoted = [...content.matchAll(/[“"《]([^”"》]{2,40})[”"》]/gu)].map((match) => match[1]);
+  const named = [...content.matchAll(/(?:叫作|叫做|称为|名字是)[“"《]?([^，”"》,。；;]{2,20})/gu)]
+    .map((match) => match[1].trim());
+  const times = content.match(/(?:周末|周[一二三四五六日天]|星期[一二三四五六日天]|礼拜[一二三四五六日天])/gu) || [];
+  let triggers = splitTriggers([...quoted, ...named, ...times], 6);
+  if (!triggers.length) {
+    const fallback = content.split(/[，,。！？!?；;\n]/u).map((item) => item.trim()).find((item) => item.length >= 2);
+    if (fallback) triggers = [fallback.slice(0, 40).toLocaleLowerCase()];
+  }
+  if (!triggers.length) return null;
+
+  return { category: "important_event", content, triggers, is_permanent: true };
+}
+
 function rankMemories(memories, currentMessage, limit = 5) {
   const message = normalizeForRecall(currentMessage);
   const messageTerms = recallTerms(currentMessage);
@@ -125,6 +147,7 @@ function formatLongTermMemories(memories) {
 module.exports = {
   formatLongTermMemories,
   parseMemoryExtraction,
+  parseExplicitMemoryRequest,
   rankMemories,
   splitTriggers,
 };

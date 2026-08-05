@@ -11,6 +11,7 @@ const {
 } = require("./core/context");
 const {
   formatLongTermMemories,
+  parseExplicitMemoryRequest,
   parseMemoryExtraction,
   rankMemories,
   splitTriggers,
@@ -426,6 +427,36 @@ async function extractLongTermMemories({ userId, character, userProfile, session
   if (!rows.length) return;
   const { error } = await supabase.from("memories").insert(rows);
   if (error) throw error;
+}
+
+async function saveExplicitMemory({ userId, characterId, sessionId, candidate }) {
+  const { data: existing, error: existingError } = await supabase.from("memories")
+    .select("id, content, triggers, status, is_permanent")
+    .eq("user_id", userId).eq("character_id", characterId)
+    .neq("status", "deleted").order("updated_at", { ascending: false }).limit(100);
+  if (existingError) throw existingError;
+
+  const normalized = candidate.content.trim().toLocaleLowerCase();
+  const duplicate = (existing || []).find((memory) => memory.content.trim().toLocaleLowerCase() === normalized);
+  if (duplicate) {
+    const { data, error } = await supabase.from("memories").update({
+      triggers: splitTriggers([...(duplicate.triggers || []), ...candidate.triggers], 6),
+      status: "active",
+      is_permanent: true,
+      updated_at: new Date().toISOString(),
+    }).eq("id", duplicate.id).eq("user_id", userId).select().single();
+    if (error) throw error;
+    return data;
+  }
+
+  const { data, error } = await supabase.from("memories").insert({
+    ...candidate,
+    user_id: userId,
+    character_id: characterId,
+    source_session_id: sessionId,
+  }).select().single();
+  if (error) throw error;
+  return data;
 }
 
 app.get("/health", (req, res) => {
@@ -872,16 +903,41 @@ app.post("/chat", async (req, res) => {
       await touchSession(sessionId, req.user.id);
     }
 
-    res.json({ success: true, sessionId, title, reply, messageId: assistantMessage.id });
-    extractLongTermMemories({
-      userId: req.user.id,
-      character,
-      userProfile,
+    const explicitMemory = parseExplicitMemoryRequest(message);
+    let capturedMemoryId = null;
+    if (explicitMemory) {
+      try {
+        const captured = await saveExplicitMemory({
+          userId: req.user.id,
+          characterId: character.id,
+          sessionId,
+          candidate: explicitMemory,
+        });
+        capturedMemoryId = captured.id;
+      } catch (memoryError) {
+        console.error("Explicit long-term memory save failed:", memoryError);
+      }
+    }
+
+    res.json({
+      success: true,
       sessionId,
-      message,
+      title,
       reply,
-      settings,
-    }).catch((memoryError) => console.error("Long-term memory extraction failed:", memoryError));
+      messageId: assistantMessage.id,
+      memoryCapture: explicitMemory ? (capturedMemoryId ? "saved" : "failed") : "automatic_pending",
+    });
+    if (!explicitMemory) {
+      extractLongTermMemories({
+        userId: req.user.id,
+        character,
+        userProfile,
+        sessionId,
+        message,
+        reply,
+        settings,
+      }).catch((memoryError) => console.error("Long-term memory extraction failed:", memoryError));
+    }
   } catch (error) {
     console.error("Chat failed:", error);
     res.status(500).json({ success: false, error: error.message, reply: "Sorry, I could not reply just now." });

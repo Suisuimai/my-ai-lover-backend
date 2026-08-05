@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   formatLongTermMemories,
+  parseExplicitMemoryRequest,
   parseMemoryExtraction,
   rankMemories,
   splitTriggers,
@@ -69,4 +70,17 @@ test("rankMemories maps common Chinese weekend expressions to one concept", () =
   assert.equal(rankMemories(memories, "周末有什么安排？")[0].id, "sunday-plan");
   assert.equal(rankMemories(memories, "星期天要做什么？")[0].id, "sunday-plan");
   assert.deepEqual(rankMemories(memories, "下周一有什么安排？"), []);
+});
+
+test("parseExplicitMemoryRequest reliably captures explicit Chinese requests", () => {
+  assert.deepEqual(
+    parseExplicitMemoryRequest("请记住：我把周日的模拟面试叫作“灯塔计划”。"),
+    {
+      category: "important_event",
+      content: "我把周日的模拟面试叫作“灯塔计划”。",
+      triggers: ["灯塔计划", "灯塔计划", "周日"].filter((item, index, values) => values.indexOf(item) === index),
+      is_permanent: true,
+    },
+  );
+  assert.equal(parseExplicitMemoryRequest("今天聊聊电影吧"), null);
 });
