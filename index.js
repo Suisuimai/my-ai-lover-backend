@@ -13,6 +13,7 @@ const {
   formatLongTermMemories,
   parseMemoryExtraction,
   rankMemories,
+  splitTriggers,
 } = require("./core/memory");
 
 require("dotenv").config();
@@ -515,9 +516,7 @@ app.post("/memories", async (req, res) => {
       : await getOrCreateDefaultCharacter(req.user.id);
     const category = String(req.body.category || "important_event");
     const content = textUpdate(req.body, "content", 1200);
-    const triggers = Array.isArray(req.body.triggers)
-      ? req.body.triggers.map((item) => String(item).trim().slice(0, 80)).filter(Boolean).slice(0, 3)
-      : [];
+    const triggers = splitTriggers(req.body.triggers, 6).map((item) => item.slice(0, 80));
     if (!content || !["preference", "important_event", "promise", "unfinished", "relationship"].includes(category) || !triggers.length) {
       return res.status(400).json({ success: false, error: "Valid category, content, and triggers are required" });
     }
@@ -538,8 +537,9 @@ app.patch("/memories/:memoryId", async (req, res) => {
   if (["preference", "important_event", "promise", "unfinished", "relationship"].includes(req.body.category)) updates.category = req.body.category;
   if (["active", "archived"].includes(req.body.status)) updates.status = req.body.status;
   if (typeof req.body.isPermanent === "boolean") updates.is_permanent = req.body.isPermanent;
-  if (Array.isArray(req.body.triggers)) updates.triggers = req.body.triggers
-    .map((item) => String(item).trim().slice(0, 80)).filter(Boolean).slice(0, 3);
+  if (Array.isArray(req.body.triggers) || typeof req.body.triggers === "string") {
+    updates.triggers = splitTriggers(req.body.triggers, 6).map((item) => item.slice(0, 80));
+  }
   if (!Object.keys(updates).length) return res.status(400).json({ success: false, error: "No memory fields were provided" });
   updates.updated_at = new Date().toISOString();
   const { data, error } = await supabase.from("memories").update(updates)
