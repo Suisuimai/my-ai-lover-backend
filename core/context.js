@@ -35,6 +35,7 @@ function buildModelContext({
   systemPrompt,
   characterProfile,
   userProfile,
+  followUps,
   longTermMemories,
   memorySummary,
   recentMessages,
@@ -44,6 +45,7 @@ function buildModelContext({
     ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
     ...(characterProfile ? [{ role: "system", content: characterProfile }] : []),
     ...(userProfile ? [{ role: "system", content: userProfile }] : []),
+    ...(followUps ? [{ role: "system", content: followUps }] : []),
     ...(longTermMemories ? [{ role: "system", content: longTermMemories }] : []),
     ...(memorySummary
       ? [{ role: "system", content: `Conversation memory summary:\n${memorySummary}` }]
