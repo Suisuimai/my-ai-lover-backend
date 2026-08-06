@@ -16,6 +16,13 @@ const {
   rankMemories,
   splitTriggers,
 } = require("./core/memory");
+const {
+  FOLLOW_UP_KINDS,
+  FOLLOW_UP_STATUSES,
+  formatFollowUps,
+  parseExplicitFollowUpRequest,
+  selectRelevantFollowUps,
+} = require("./core/followup");
 
 require("dotenv").config();
 
@@ -386,6 +393,15 @@ async function recallMemories(userId, characterId, currentMessage) {
   return selected;
 }
 
+async function recallFollowUps(userId, characterId, currentMessage) {
+  const { data, error } = await supabase.from("follow_ups").select("*")
+    .eq("user_id", userId).eq("character_id", characterId)
+    .in("status", ["active", "waiting"])
+    .order("updated_at", { ascending: false }).limit(200);
+  if (error) throw error;
+  return selectRelevantFollowUps(data || [], currentMessage, 3);
+}
+
 async function extractLongTermMemories({ userId, character, userProfile, sessionId, message, reply, settings }) {
   const { data: existing, error: existingError } = await supabase.from("memories")
     .select("content").eq("user_id", userId).eq("character_id", character.id)
@@ -450,6 +466,27 @@ async function saveExplicitMemory({ userId, characterId, sessionId, candidate })
   }
 
   const { data, error } = await supabase.from("memories").insert({
+    ...candidate,
+    user_id: userId,
+    character_id: characterId,
+    source_session_id: sessionId,
+  }).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function saveExplicitFollowUp({ userId, characterId, sessionId, candidate }) {
+  const { data: existing, error: existingError } = await supabase.from("follow_ups")
+    .select("id, title, content, status")
+    .eq("user_id", userId).eq("character_id", characterId)
+    .in("status", ["active", "waiting", "paused"])
+    .order("updated_at", { ascending: false }).limit(100);
+  if (existingError) throw existingError;
+  const normalizedTitle = candidate.title.trim().toLocaleLowerCase();
+  const duplicate = (existing || []).find((item) => item.title.trim().toLocaleLowerCase() === normalizedTitle);
+  if (duplicate) return duplicate;
+
+  const { data, error } = await supabase.from("follow_ups").insert({
     ...candidate,
     user_id: userId,
     character_id: characterId,
@@ -586,6 +623,93 @@ app.delete("/memories/:memoryId", async (req, res) => {
   }).eq("id", req.params.memoryId).eq("user_id", req.user.id).select("id").maybeSingle();
   if (error) return res.status(500).json({ success: false, error: error.message });
   if (!data) return res.status(404).json({ success: false, error: "Memory not found" });
+  res.status(204).end();
+});
+
+app.get("/follow-ups", async (req, res) => {
+  try {
+    const character = req.query.characterId
+      ? await getOwnedCharacter(req.query.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const { data, error } = await supabase.from("follow_ups").select("*")
+      .eq("user_id", req.user.id).eq("character_id", character.id)
+      .neq("status", "cancelled").order("updated_at", { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, followUps: data });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/follow-ups", async (req, res) => {
+  try {
+    const character = req.body.characterId
+      ? await getOwnedCharacter(req.body.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const title = textUpdate(req.body, "title", 120);
+    const content = textUpdate(req.body, "content", 1200);
+    const nextStep = textUpdate(req.body, "nextStep", 600) || "";
+    const kind = FOLLOW_UP_KINDS.has(req.body.kind) ? req.body.kind : "plan";
+    const triggers = splitTriggers(req.body.triggers, 6).map((item) => item.slice(0, 80));
+    const dueAt = req.body.dueAt ? new Date(req.body.dueAt) : null;
+    if (!title || !content || !triggers.length || (dueAt && Number.isNaN(dueAt.getTime()))) {
+      return res.status(400).json({ success: false, error: "Valid title, content, triggers, and optional date are required" });
+    }
+    const { data, error } = await supabase.from("follow_ups").insert({
+      user_id: req.user.id,
+      character_id: character.id,
+      title,
+      kind,
+      content,
+      next_step: nextStep,
+      triggers,
+      due_at: dueAt ? dueAt.toISOString() : null,
+      allow_proactive: req.body.allowProactive === true,
+    }).select().single();
+    if (error) throw error;
+    res.status(201).json({ success: true, followUp: data });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.patch("/follow-ups/:followUpId", async (req, res) => {
+  const updates = {};
+  for (const [bodyKey, column, max] of [
+    ["title", "title", 120], ["content", "content", 1200], ["nextStep", "next_step", 600],
+  ]) {
+    const value = textUpdate(req.body, bodyKey, max);
+    if (value !== undefined) updates[column] = value;
+  }
+  if (updates.title === "" || updates.content === "") {
+    return res.status(400).json({ success: false, error: "Title and content cannot be empty" });
+  }
+  if (FOLLOW_UP_KINDS.has(req.body.kind)) updates.kind = req.body.kind;
+  if (FOLLOW_UP_STATUSES.has(req.body.status)) updates.status = req.body.status;
+  if (typeof req.body.allowProactive === "boolean") updates.allow_proactive = req.body.allowProactive;
+  if (Array.isArray(req.body.triggers) || typeof req.body.triggers === "string") {
+    updates.triggers = splitTriggers(req.body.triggers, 6).map((item) => item.slice(0, 80));
+  }
+  if (req.body.dueAt === null || req.body.dueAt === "") updates.due_at = null;
+  else if (req.body.dueAt !== undefined) {
+    const dueAt = new Date(req.body.dueAt);
+    if (Number.isNaN(dueAt.getTime())) return res.status(400).json({ success: false, error: "Invalid date" });
+    updates.due_at = dueAt.toISOString();
+  }
+  if (!Object.keys(updates).length) return res.status(400).json({ success: false, error: "No follow-up fields were provided" });
+  updates.updated_at = new Date().toISOString();
+  const { data, error } = await supabase.from("follow_ups").update(updates)
+    .eq("id", req.params.followUpId).eq("user_id", req.user.id).select().maybeSingle();
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (!data) return res.status(404).json({ success: false, error: "Follow-up not found" });
+  res.json({ success: true, followUp: data });
+});
+
+app.delete("/follow-ups/:followUpId", async (req, res) => {
+  const { data, error } = await supabase.from("follow_ups").delete()
+    .eq("id", req.params.followUpId).eq("user_id", req.user.id).select("id").maybeSingle();
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (!data) return res.status(404).json({ success: false, error: "Follow-up not found" });
   res.status(204).end();
 });
 
@@ -837,6 +961,12 @@ app.post("/chat", async (req, res) => {
     } catch (recallError) {
       console.error("Long-term memory recall failed:", recallError);
     }
+    let relevantFollowUps = [];
+    try {
+      relevantFollowUps = await recallFollowUps(req.user.id, character.id, message);
+    } catch (followUpError) {
+      console.error("Follow-up recall failed:", followUpError);
+    }
     let memorySummary;
     try {
       memorySummary = await maybeCompressMemory(sessionId, settings, req.user.id);
@@ -868,6 +998,7 @@ app.post("/chat", async (req, res) => {
         : "",
       characterProfile: formatCharacterProfile(character),
       userProfile: formatUserProfile(userProfile),
+      followUps: formatFollowUps(relevantFollowUps),
       longTermMemories: formatLongTermMemories(relevantMemories),
       memorySummary,
       recentMessages: recentHistory.reverse(),
@@ -904,6 +1035,7 @@ app.post("/chat", async (req, res) => {
     }
 
     const explicitMemory = parseExplicitMemoryRequest(message);
+    const explicitFollowUp = parseExplicitFollowUpRequest(message);
     let capturedMemoryId = null;
     if (explicitMemory) {
       try {
@@ -918,6 +1050,20 @@ app.post("/chat", async (req, res) => {
         console.error("Explicit long-term memory save failed:", memoryError);
       }
     }
+    let followUpCapture = explicitFollowUp ? "failed" : "none";
+    if (explicitFollowUp) {
+      try {
+        await saveExplicitFollowUp({
+          userId: req.user.id,
+          characterId: character.id,
+          sessionId,
+          candidate: explicitFollowUp,
+        });
+        followUpCapture = "saved";
+      } catch (followUpError) {
+        console.error("Explicit follow-up save failed:", followUpError);
+      }
+    }
 
     res.json({
       success: true,
@@ -926,6 +1072,7 @@ app.post("/chat", async (req, res) => {
       reply,
       messageId: assistantMessage.id,
       memoryCapture: explicitMemory ? (capturedMemoryId ? "saved" : "failed") : "automatic_pending",
+      followUpCapture,
     });
     if (!explicitMemory) {
       extractLongTermMemories({
