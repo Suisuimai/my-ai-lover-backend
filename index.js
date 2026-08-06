@@ -22,6 +22,7 @@ const {
   formatFollowUps,
   parseExplicitFollowUpRequest,
   selectRelevantFollowUps,
+  suggestFollowUpStatus,
 } = require("./core/followup");
 
 require("dotenv").config();
@@ -1034,6 +1035,7 @@ app.post("/chat", async (req, res) => {
       await touchSession(sessionId, req.user.id);
     }
 
+    const followUpStatusSuggestion = suggestFollowUpStatus(relevantFollowUps, message);
     const explicitMemory = parseExplicitMemoryRequest(message);
     const explicitFollowUp = parseExplicitFollowUpRequest(message);
     let capturedMemoryId = null;
@@ -1073,6 +1075,7 @@ app.post("/chat", async (req, res) => {
       messageId: assistantMessage.id,
       memoryCapture: explicitMemory ? (capturedMemoryId ? "saved" : "failed") : "automatic_pending",
       followUpCapture,
+      followUpStatusSuggestion,
     });
     if (!explicitMemory) {
       extractLongTermMemories({

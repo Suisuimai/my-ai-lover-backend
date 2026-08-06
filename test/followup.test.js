@@ -4,6 +4,7 @@ const {
   formatFollowUps,
   parseExplicitFollowUpRequest,
   selectRelevantFollowUps,
+  suggestFollowUpStatus,
 } = require("../core/followup");
 
 test("parseExplicitFollowUpRequest captures an explicitly requested follow-up", () => {
@@ -31,4 +32,17 @@ test("formatFollowUps adds low-pressure boundaries", () => {
 
   const contextOnly = formatFollowUps([{ title: "申请", kind: "waiting_result", status: "waiting", content: "等待回复", allow_proactive: false }]);
   assert.match(contextOnly, /do not initiate a follow-up/);
+});
+test("suggestFollowUpStatus proposes conservative user-confirmed transitions", () => {
+  const active = [{ id: "plan-1", title: "灯塔计划", status: "active" }];
+  assert.deepEqual(suggestFollowUpStatus(active, "灯塔计划已经完成了"), {
+    followUpId: "plan-1",
+    title: "灯塔计划",
+    currentStatus: "active",
+    suggestedStatus: "completed",
+    reason: "你似乎在说这件事已经有了结果",
+  });
+  assert.equal(suggestFollowUpStatus([{ ...active[0], status: "waiting" }], "还在等待回复"), null);
+  assert.equal(suggestFollowUpStatus(active, "今天只是随便聊聊"), null);
+  assert.equal(suggestFollowUpStatus(active, "希望这次能够成功"), null);
 });
