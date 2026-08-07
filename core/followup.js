@@ -47,8 +47,20 @@ function suggestFollowUpStatus(followUps, currentMessage) {
   return { followUpId: item.id, title: item.title, currentStatus: item.status, ...signal };
 }
 
+function selectStatusRelevantFollowUps(followUps, currentMessage, limit = 1) {
+  const message = String(currentMessage || "").trim().toLocaleLowerCase();
+  if (!message) return [];
+  const candidates = followUps.filter((item) => {
+    if (!item || item.status === "cancelled") return false;
+    const keys = [item.title, ...(item.triggers || [])]
+      .map((key) => String(key || "").trim().toLocaleLowerCase())
+      .filter((key) => key.length >= 2);
+    return keys.some((key) => message.includes(key));
+  });
+  return candidates.length === 1 ? candidates.slice(0, limit) : [];
+}
 function selectContextualFollowUps(followUps, currentMessage, recentMessages, limit = 1) {
-  const direct = selectRelevantFollowUps(followUps, currentMessage, limit);
+  const direct = selectStatusRelevantFollowUps(followUps, currentMessage, limit);
   if (direct.length || !detectFollowUpStatus(currentMessage)) return direct;
   const contextText = (recentMessages || [])
     .map((entry) => typeof entry === "string" ? entry : entry?.content)
@@ -66,6 +78,23 @@ function selectContextualFollowUps(followUps, currentMessage, recentMessages, li
   return candidates.length === 1 ? candidates.slice(0, limit) : [];
 }
 
+function buildFollowUpStatusMemory(followUp, status) {
+  const descriptions = {
+    active: { category: "unfinished", content: followUp.title + "已重新开始推进" },
+    waiting: { category: "unfinished", content: followUp.title + "仍在等待结果" },
+    completed: { category: "important_event", content: followUp.title + "已完成" },
+    paused: { category: "unfinished", content: followUp.title + "暂时搁置" },
+  };
+  const event = descriptions[status];
+  if (!event) return null;
+  return {
+    ...event,
+    triggers: splitTriggers([followUp.title, ...(followUp.triggers || [])], 6),
+    is_permanent: false,
+    source_follow_up_id: followUp.id,
+    event_status: status,
+  };
+}
 function selectRelevantFollowUps(followUps, currentMessage, limit = 3) {
   return rankMemories(
     followUps
@@ -95,9 +124,12 @@ function formatFollowUps(followUps) {
 module.exports = {
   FOLLOW_UP_KINDS,
   FOLLOW_UP_STATUSES,
+  buildFollowUpStatusMemory,
+  detectFollowUpStatus,
   formatFollowUps,
   parseExplicitFollowUpRequest,
   selectRelevantFollowUps,
+  selectStatusRelevantFollowUps,
   selectContextualFollowUps,
   suggestFollowUpStatus,
 };
