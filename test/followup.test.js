@@ -1,9 +1,11 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
+  buildFollowUpStatusMemory,
   formatFollowUps,
   parseExplicitFollowUpRequest,
   selectRelevantFollowUps,
+  selectStatusRelevantFollowUps,
   selectContextualFollowUps,
   suggestFollowUpStatus,
 } = require("../core/followup");
@@ -62,4 +64,21 @@ test("selectContextualFollowUps resolves a pronoun-like status update from nearb
     [],
   );
   assert.deepEqual(selectContextualFollowUps(rows, "今天吃什么", [{ content: "灯塔计划" }]), []);
+});
+test("status selection and event memories work for arbitrary topic names", () => {
+  const topics = [
+    { id: "a", title: "签证申请", content: "等待使馆结果", triggers: ["签证", "使馆"], status: "completed" },
+    { id: "b", title: "秋季旅行", content: "规划路线", triggers: ["旅行"], status: "paused" },
+  ];
+  assert.deepEqual(selectStatusRelevantFollowUps(topics, "签证申请还在等结果").map(({ id }) => id), ["a"]);
+  assert.deepEqual(selectStatusRelevantFollowUps(topics, "签证申请和秋季旅行都有结果"), []);
+  assert.deepEqual(buildFollowUpStatusMemory(topics[0], "waiting"), {
+    category: "unfinished",
+    content: "签证申请仍在等待结果",
+    triggers: ["签证申请", "签证", "使馆"],
+    is_permanent: false,
+    source_follow_up_id: "a",
+    event_status: "waiting",
+  });
+  assert.equal(buildFollowUpStatusMemory(topics[0], "cancelled"), null);
 });
