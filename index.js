@@ -22,6 +22,7 @@ const {
   formatFollowUps,
   parseExplicitFollowUpRequest,
   selectRelevantFollowUps,
+  selectContextualFollowUps,
   suggestFollowUpStatus,
 } = require("./core/followup");
 
@@ -394,13 +395,13 @@ async function recallMemories(userId, characterId, currentMessage) {
   return selected;
 }
 
-async function recallFollowUps(userId, characterId, currentMessage) {
+async function loadActiveFollowUps(userId, characterId) {
   const { data, error } = await supabase.from("follow_ups").select("*")
     .eq("user_id", userId).eq("character_id", characterId)
     .in("status", ["active", "waiting"])
     .order("updated_at", { ascending: false }).limit(200);
   if (error) throw error;
-  return selectRelevantFollowUps(data || [], currentMessage, 3);
+  return data || [];
 }
 
 async function extractLongTermMemories({ userId, character, userProfile, sessionId, message, reply, settings }) {
@@ -962,9 +963,11 @@ app.post("/chat", async (req, res) => {
     } catch (recallError) {
       console.error("Long-term memory recall failed:", recallError);
     }
+    let activeFollowUps = [];
     let relevantFollowUps = [];
     try {
-      relevantFollowUps = await recallFollowUps(req.user.id, character.id, message);
+      activeFollowUps = await loadActiveFollowUps(req.user.id, character.id);
+      relevantFollowUps = selectRelevantFollowUps(activeFollowUps, message, 3);
     } catch (followUpError) {
       console.error("Follow-up recall failed:", followUpError);
     }
@@ -991,6 +994,10 @@ app.post("/chat", async (req, res) => {
       .order("created_at", { ascending: false })
       .limit(normalizeRecentMessageLimit(settings.recent_message_limit));
     if (historyError) throw historyError;
+
+    if (!relevantFollowUps.length) {
+      relevantFollowUps = selectContextualFollowUps(activeFollowUps, message, recentHistory, 1);
+    }
 
     const context = buildModelContext({
       platformRules: PLATFORM_RULES,
