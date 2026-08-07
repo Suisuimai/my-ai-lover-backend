@@ -4,6 +4,7 @@ const {
   formatFollowUps,
   parseExplicitFollowUpRequest,
   selectRelevantFollowUps,
+  selectContextualFollowUps,
   suggestFollowUpStatus,
 } = require("../core/followup");
 
@@ -45,4 +46,20 @@ test("suggestFollowUpStatus proposes conservative user-confirmed transitions", (
   assert.equal(suggestFollowUpStatus([{ ...active[0], status: "waiting" }], "还在等待回复"), null);
   assert.equal(suggestFollowUpStatus(active, "今天只是随便聊聊"), null);
   assert.equal(suggestFollowUpStatus(active, "希望这次能够成功"), null);
+});
+
+test("selectContextualFollowUps resolves a pronoun-like status update from nearby chat", () => {
+  const rows = [
+    { id: "plan-1", title: "灯塔计划", content: "周日模拟面试", triggers: ["灯塔计划"], status: "active" },
+    { id: "plan-2", title: "旅行计划", content: "年底旅行", triggers: ["旅行计划"], status: "active" },
+  ];
+  assert.deepEqual(
+    selectContextualFollowUps(rows, "已经完成了", [{ content: "灯塔计划准备得怎么样？" }]).map(({ id }) => id),
+    ["plan-1"],
+  );
+  assert.deepEqual(
+    selectContextualFollowUps(rows, "我还在等结果", [{ content: "灯塔计划和旅行计划都怎么样？" }]),
+    [],
+  );
+  assert.deepEqual(selectContextualFollowUps(rows, "今天吃什么", [{ content: "灯塔计划" }]), []);
 });
