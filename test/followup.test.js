@@ -73,7 +73,7 @@ test("status selection and event memories work for arbitrary topic names", () =>
   assert.deepEqual(selectStatusRelevantFollowUps(topics, "签证申请还在等结果").map(({ id }) => id), ["a"]);
   assert.deepEqual(selectStatusRelevantFollowUps(topics, "签证申请和秋季旅行都有结果"), []);
   assert.deepEqual(buildFollowUpStatusMemory(topics[0], "waiting"), {
-    category: "unfinished",
+    category: "important_event",
     content: "签证申请仍在等待结果",
     triggers: ["签证申请", "签证", "使馆"],
     is_permanent: false,

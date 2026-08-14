@@ -2,7 +2,6 @@ const MEMORY_CATEGORIES = new Set([
   "preference",
   "important_event",
   "promise",
-  "unfinished",
   "relationship",
 ]);
 
