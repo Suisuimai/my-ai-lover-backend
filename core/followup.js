@@ -80,10 +80,10 @@ function selectContextualFollowUps(followUps, currentMessage, recentMessages, li
 
 function buildFollowUpStatusMemory(followUp, status) {
   const descriptions = {
-    active: { category: "unfinished", content: followUp.title + "已重新开始推进" },
-    waiting: { category: "unfinished", content: followUp.title + "仍在等待结果" },
+    active: { category: "important_event", content: followUp.title + "已重新开始推进" },
+    waiting: { category: "important_event", content: followUp.title + "仍在等待结果" },
     completed: { category: "important_event", content: followUp.title + "已完成" },
-    paused: { category: "unfinished", content: followUp.title + "暂时搁置" },
+    paused: { category: "important_event", content: followUp.title + "暂时搁置" },
   };
   const event = descriptions[status];
   if (!event) return null;

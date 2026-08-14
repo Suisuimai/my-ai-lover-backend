@@ -16,6 +16,7 @@ const {
   rankMemories,
   splitTriggers,
 } = require("./core/memory");
+const { buildSemanticEventPrompt, parseSemanticEventDecision } = require("./core/eventInterpreter");
 const {
   FOLLOW_UP_KINDS,
   FOLLOW_UP_STATUSES,
@@ -407,6 +408,24 @@ async function loadStatusFollowUps(userId, characterId) {
   return data || [];
 }
 
+async function interpretSemanticEvent({ userId, settings, message, recentMessages, followUps }) {
+  const localDate = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Shanghai", dateStyle: "short", timeStyle: "medium",
+  }).format(new Date()) + " Asia/Shanghai";
+  const raw = await callModel({
+    model: settings.summary_model,
+    temperature: 0,
+    maxTokens: 450,
+    userId,
+    messages: [
+      { role: "system", content: "You extract structured relationship-continuity events. Follow the schema exactly and never invent a topic." },
+      { role: "user", content: buildSemanticEventPrompt({
+        currentMessage: message, recentMessages, followUps, localDate,
+      }) },
+    ],
+  });
+  return parseSemanticEventDecision(raw, followUps);
+}
 async function extractLongTermMemories({ userId, character, userProfile, sessionId, message, reply, settings }) {
   const { data: existing, error: existingError } = await supabase.from("memories")
     .select("content").eq("user_id", userId).eq("character_id", character.id)
@@ -415,7 +434,7 @@ async function extractLongTermMemories({ userId, character, userProfile, session
 
   const extractionPrompt = [
     "Extract only durable, explicitly supported memories from this single exchange.",
-    "Allowed categories: preference, important_event, promise, unfinished, relationship.",
+    "Allowed categories: preference, important_event, promise, relationship.",
     "Do not turn temporary moods, guesses, ordinary questions, or routine pleasantries into lasting facts.",
     "Use third person and the provided names. Return a JSON array only.",
     'Each item: {"category":"...","content":"...","triggers":["1-3 specific recall phrases"]}.',
@@ -715,9 +734,52 @@ app.patch("/follow-ups/:followUpId", async (req, res) => {
   res.json({ success: true, followUp: data });
 });
 
+app.post("/follow-up-events/confirm-create", async (req, res) => {
+  try {
+    const sessionId = typeof req.body.sessionId === "string" ? req.body.sessionId : "";
+    if (!sessionId) return res.status(400).json({ success: false, error: "A session is required" });
+    const session = await requireOwnedSession(sessionId, req.user.id);
+    const character = session.character_id
+      ? await getOwnedCharacter(session.character_id, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const title = textUpdate(req.body, "title", 120);
+    const content = textUpdate(req.body, "content", 1200);
+    const status = ["active", "waiting", "completed", "paused"].includes(req.body.status) ? req.body.status : null;
+    const kind = FOLLOW_UP_KINDS.has(req.body.kind) ? req.body.kind : "paused_topic";
+    const triggers = splitTriggers(req.body.triggers, 6).map((item) => item.slice(0, 80));
+    const dueAt = req.body.dueAt ? new Date(req.body.dueAt) : null;
+    const { data: duplicate, error: duplicateError } = await supabase.from("follow_ups").select("id")
+      .eq("user_id", req.user.id).eq("character_id", character.id)
+      .ilike("title", title || "").neq("status", "cancelled").limit(1).maybeSingle();
+    if (duplicateError) throw duplicateError;
+    if (duplicate) return res.status(409).json({ success: false, error: "A topic with this title already exists" });
+    if (!title || !content || !status || !triggers.length || (dueAt && Number.isNaN(dueAt.getTime()))) {
+      return res.status(400).json({ success: false, error: "Invalid semantic event" });
+    }
+    const { data: followUp, error: createError } = await supabase.from("follow_ups").insert({
+      user_id: req.user.id, character_id: character.id, title, kind, content, status, triggers,
+      due_at: dueAt ? dueAt.toISOString() : null, source_session_id: sessionId, allow_proactive: false,
+    }).select().single();
+    if (createError) throw createError;
+    try {
+      const memory = await saveExplicitMemory({
+        userId: req.user.id, characterId: character.id, sessionId,
+        candidate: buildFollowUpStatusMemory(followUp, status),
+      });
+      return res.status(201).json({ success: true, followUp, memory });
+    } catch (memoryError) {
+      await supabase.from("follow_ups").delete().eq("id", followUp.id).eq("user_id", req.user.id);
+      throw memoryError;
+    }
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
 app.post("/follow-ups/:followUpId/confirm-status", async (req, res) => {
   const nextStatus = req.body.status;
-  if (!["active", "waiting", "completed", "paused"].includes(nextStatus)) {
+  const dueAt = req.body.dueAt ? new Date(req.body.dueAt) : null;
+  if (!["active", "waiting", "completed", "paused"].includes(nextStatus)
+      || (dueAt && Number.isNaN(dueAt.getTime()))) {
     return res.status(400).json({ success: false, error: "Invalid follow-up status" });
   }
   try {
@@ -733,16 +795,17 @@ app.post("/follow-ups/:followUpId/confirm-status", async (req, res) => {
         return res.status(400).json({ success: false, error: "Session and follow-up use different companions" });
       }
     }
-    if (followUp.status === nextStatus) {
+    if (followUp.status === nextStatus && !dueAt) {
       return res.json({ success: true, followUp, memory: null, unchanged: true });
     }
 
     const candidate = buildFollowUpStatusMemory(followUp, nextStatus);
     if (!candidate) return res.status(400).json({ success: false, error: "Unsupported status event" });
     const previousStatus = followUp.status;
-    const { data: updated, error: updateError } = await supabase.from("follow_ups").update({
-      status: nextStatus, updated_at: new Date().toISOString(),
-    }).eq("id", followUp.id).eq("user_id", req.user.id).select().single();
+    const updates = { status: nextStatus, updated_at: new Date().toISOString() };
+    if (dueAt) updates.due_at = dueAt.toISOString();
+    const { data: updated, error: updateError } = await supabase.from("follow_ups").update(updates)
+      .eq("id", followUp.id).eq("user_id", req.user.id).select().single();
     if (updateError) throw updateError;
 
     let memory;
@@ -1061,6 +1124,17 @@ app.post("/chat", async (req, res) => {
       relevantFollowUps = selectContextualFollowUps(conversationalFollowUps, message, recentHistory, 1);
     }
     const statusRelevantFollowUps = selectContextualFollowUps(statusFollowUps, message, recentHistory, 1);
+    const historyChronological = [...recentHistory].reverse();
+    const semanticEventPromise = interpretSemanticEvent({
+      userId: req.user.id,
+      settings,
+      message,
+      recentMessages: recentHistory,
+      followUps: statusFollowUps,
+    }).catch((semanticError) => {
+      console.error("Semantic event interpretation failed:", semanticError);
+      return null;
+    });
 
     const context = buildModelContext({
       platformRules: PLATFORM_RULES,
@@ -1072,19 +1146,22 @@ app.post("/chat", async (req, res) => {
       followUps: formatFollowUps(relevantFollowUps),
       longTermMemories: formatLongTermMemories(relevantMemories),
       memorySummary,
-      recentMessages: recentHistory.reverse(),
+      recentMessages: historyChronological,
     });
 
     const requestedModel = typeof req.body.model === "string" && req.body.model.trim()
       ? req.body.model.trim()
       : settings.model;
-    const reply = await callModel({
-      model: requestedModel,
-      temperature: settings.temperature,
-      maxTokens: settings.max_tokens,
-      messages: context,
-      userId: req.user.id,
-    });
+    const [reply, semanticEventSuggestion] = await Promise.all([
+      callModel({
+        model: requestedModel,
+        temperature: settings.temperature,
+        maxTokens: settings.max_tokens,
+        messages: context,
+        userId: req.user.id,
+      }),
+      semanticEventPromise,
+    ]);
 
     const { data: assistantMessage, error: assistantMessageError } = await supabase
       .from("messages")
@@ -1105,8 +1182,12 @@ app.post("/chat", async (req, res) => {
       await touchSession(sessionId, req.user.id);
     }
 
-    const statusEventRecognized = statusRelevantFollowUps.length > 0 && Boolean(detectFollowUpStatus(message));
-    const followUpStatusSuggestion = suggestFollowUpStatus(statusRelevantFollowUps, message);
+    const ruleBasedSuggestion = suggestFollowUpStatus(statusRelevantFollowUps, message);
+    const followUpStatusSuggestion = semanticEventSuggestion || (ruleBasedSuggestion
+      ? { action: "update", ...ruleBasedSuggestion }
+      : null);
+    const statusEventRecognized = Boolean(followUpStatusSuggestion)
+      || (statusRelevantFollowUps.length > 0 && Boolean(detectFollowUpStatus(message)));
     const explicitMemory = parseExplicitMemoryRequest(message);
     const explicitFollowUp = parseExplicitFollowUpRequest(message);
     let capturedMemoryId = null;
