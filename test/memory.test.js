@@ -22,6 +22,7 @@ test("parseMemoryExtraction validates categories, content, and triggers", () => 
   const parsed = parseMemoryExtraction(JSON.stringify([
     { category: "promise", content: " Xiaoyu and Lan agreed to practise on Sunday. ", triggers: ["Sunday", "Interview", "Sunday"] },
     { category: "guess", content: "Unsupported", triggers: ["guess"] },
+    { category: "unfinished", content: "Waiting state belongs to follow-ups", triggers: ["waiting"] },
     { category: "preference", content: "Missing triggers", triggers: [] },
   ]));
   assert.deepEqual(parsed, [{

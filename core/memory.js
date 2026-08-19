@@ -144,6 +144,7 @@ function formatLongTermMemories(memories) {
 }
 
 module.exports = {
+  MEMORY_CATEGORIES,
   formatLongTermMemories,
   parseMemoryExtraction,
   parseExplicitMemoryRequest,
