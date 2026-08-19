@@ -10,6 +10,7 @@ const {
   normalizeRecentMessageLimit,
 } = require("./core/context");
 const {
+  MEMORY_CATEGORIES,
   formatLongTermMemories,
   parseExplicitMemoryRequest,
   parseMemoryExtraction,
@@ -20,8 +21,6 @@ const { buildSemanticEventPrompt, parseSemanticEventDecision } = require("./core
 const {
   FOLLOW_UP_KINDS,
   FOLLOW_UP_STATUSES,
-  buildFollowUpStatusMemory,
-  detectFollowUpStatus,
   formatFollowUps,
   parseExplicitFollowUpRequest,
   selectRelevantFollowUps,
@@ -436,6 +435,8 @@ async function extractLongTermMemories({ userId, character, userProfile, session
     "Extract only durable, explicitly supported memories from this single exchange.",
     "Allowed categories: preference, important_event, promise, relationship.",
     "Do not turn temporary moods, guesses, ordinary questions, or routine pleasantries into lasting facts.",
+    "Do not store follow-up lifecycle states such as active, waiting, paused, or when to revisit; the follow-up module owns those.",
+    "A durable real-world outcome may be stored as important_event, but never attach workflow status to the memory.",
     "Use third person and the provided names. Return a JSON array only.",
     'Each item: {"category":"...","content":"...","triggers":["1-3 specific recall phrases"]}.',
     "Return [] when nothing is worth retaining. Maximum 2 items.",
@@ -471,23 +472,18 @@ async function extractLongTermMemories({ userId, character, userProfile, session
 
 async function saveExplicitMemory({ userId, characterId, sessionId, candidate }) {
   const { data: existing, error: existingError } = await supabase.from("memories")
-    .select("id, content, triggers, status, is_permanent, source_follow_up_id, event_status")
+    .select("id, content, triggers, status, is_permanent")
     .eq("user_id", userId).eq("character_id", characterId)
     .neq("status", "deleted").order("updated_at", { ascending: false }).limit(100);
   if (existingError) throw existingError;
 
   const normalized = candidate.content.trim().toLocaleLowerCase();
-  const duplicate = (existing || []).find((memory) =>
-    memory.content.trim().toLocaleLowerCase() === normalized
-    && (!candidate.source_follow_up_id || memory.source_follow_up_id === candidate.source_follow_up_id)
-  );
+  const duplicate = (existing || []).find((memory) => memory.content.trim().toLocaleLowerCase() === normalized);
   if (duplicate) {
     const { data, error } = await supabase.from("memories").update({
       triggers: splitTriggers([...(duplicate.triggers || []), ...candidate.triggers], 6),
       status: "active",
       is_permanent: candidate.is_permanent === true || duplicate.is_permanent,
-      source_follow_up_id: candidate.source_follow_up_id || duplicate.source_follow_up_id,
-      event_status: candidate.event_status || duplicate.event_status,
       updated_at: new Date().toISOString(),
     }).eq("id", duplicate.id).eq("user_id", userId).select().single();
     if (error) throw error;
@@ -614,7 +610,7 @@ app.post("/memories", async (req, res) => {
     const category = String(req.body.category || "important_event");
     const content = textUpdate(req.body, "content", 1200);
     const triggers = splitTriggers(req.body.triggers, 6).map((item) => item.slice(0, 80));
-    if (!content || !["preference", "important_event", "promise", "unfinished", "relationship"].includes(category) || !triggers.length) {
+    if (!content || !MEMORY_CATEGORIES.has(category) || !triggers.length) {
       return res.status(400).json({ success: false, error: "Valid category, content, and triggers are required" });
     }
     const { data, error } = await supabase.from("memories").insert({
@@ -631,7 +627,7 @@ app.patch("/memories/:memoryId", async (req, res) => {
   const updates = {};
   const content = textUpdate(req.body, "content", 1200);
   if (content !== undefined) updates.content = content;
-  if (["preference", "important_event", "promise", "unfinished", "relationship"].includes(req.body.category)) updates.category = req.body.category;
+  if (MEMORY_CATEGORIES.has(req.body.category)) updates.category = req.body.category;
   if (["active", "archived"].includes(req.body.status)) updates.status = req.body.status;
   if (typeof req.body.isPermanent === "boolean") updates.is_permanent = req.body.isPermanent;
   if (Array.isArray(req.body.triggers) || typeof req.body.triggers === "string") {
@@ -734,7 +730,7 @@ app.patch("/follow-ups/:followUpId", async (req, res) => {
   res.json({ success: true, followUp: data });
 });
 
-app.post("/follow-up-events/confirm-create", async (req, res) => {
+app.post("/follow-ups/confirm-create", async (req, res) => {
   try {
     const sessionId = typeof req.body.sessionId === "string" ? req.body.sessionId : "";
     if (!sessionId) return res.status(400).json({ success: false, error: "A session is required" });
@@ -761,16 +757,7 @@ app.post("/follow-up-events/confirm-create", async (req, res) => {
       due_at: dueAt ? dueAt.toISOString() : null, source_session_id: sessionId, allow_proactive: false,
     }).select().single();
     if (createError) throw createError;
-    try {
-      const memory = await saveExplicitMemory({
-        userId: req.user.id, characterId: character.id, sessionId,
-        candidate: buildFollowUpStatusMemory(followUp, status),
-      });
-      return res.status(201).json({ success: true, followUp, memory });
-    } catch (memoryError) {
-      await supabase.from("follow_ups").delete().eq("id", followUp.id).eq("user_id", req.user.id);
-      throw memoryError;
-    }
+    return res.status(201).json({ success: true, followUp });
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });
   }
@@ -796,36 +783,15 @@ app.post("/follow-ups/:followUpId/confirm-status", async (req, res) => {
       }
     }
     if (followUp.status === nextStatus && !dueAt) {
-      return res.json({ success: true, followUp, memory: null, unchanged: true });
+      return res.json({ success: true, followUp, unchanged: true });
     }
 
-    const candidate = buildFollowUpStatusMemory(followUp, nextStatus);
-    if (!candidate) return res.status(400).json({ success: false, error: "Unsupported status event" });
-    const previousStatus = followUp.status;
     const updates = { status: nextStatus, updated_at: new Date().toISOString() };
     if (dueAt) updates.due_at = dueAt.toISOString();
     const { data: updated, error: updateError } = await supabase.from("follow_ups").update(updates)
       .eq("id", followUp.id).eq("user_id", req.user.id).select().single();
     if (updateError) throw updateError;
-
-    let memory;
-    try {
-      memory = await saveExplicitMemory({
-        userId: req.user.id, characterId: followUp.character_id, sessionId, candidate,
-      });
-    } catch (memoryError) {
-      await supabase.from("follow_ups").update({
-        status: previousStatus, updated_at: new Date().toISOString(),
-      }).eq("id", followUp.id).eq("user_id", req.user.id);
-      throw memoryError;
-    }
-
-    const { error: supersedeError } = await supabase.from("memories").update({
-      status: "superseded", updated_at: new Date().toISOString(),
-    }).eq("user_id", req.user.id).eq("source_follow_up_id", followUp.id)
-      .eq("status", "active").neq("id", memory.id);
-    if (supersedeError) console.error("Previous follow-up event memories were not superseded:", supersedeError);
-    res.json({ success: true, followUp: updated, memory, unchanged: false });
+    res.json({ success: true, followUp: updated, unchanged: false });
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });
   }
@@ -1186,8 +1152,6 @@ app.post("/chat", async (req, res) => {
     const followUpStatusSuggestion = semanticEventSuggestion || (ruleBasedSuggestion
       ? { action: "update", ...ruleBasedSuggestion }
       : null);
-    const statusEventRecognized = Boolean(followUpStatusSuggestion)
-      || (statusRelevantFollowUps.length > 0 && Boolean(detectFollowUpStatus(message)));
     const explicitMemory = parseExplicitMemoryRequest(message);
     const explicitFollowUp = parseExplicitFollowUpRequest(message);
     let capturedMemoryId = null;
@@ -1229,7 +1193,7 @@ app.post("/chat", async (req, res) => {
       followUpCapture,
       followUpStatusSuggestion,
     });
-    if (!explicitMemory && !statusEventRecognized) {
+    if (!explicitMemory && (!followUpStatusSuggestion || followUpStatusSuggestion.suggestedStatus === "completed")) {
       extractLongTermMemories({
         userId: req.user.id,
         character,
