@@ -11,8 +11,8 @@ const {
 
 test("buildModelContext preserves stable, summary, and recent-message order", () => {
   const context = buildModelContext({
-    platformRules: "Platform safety rules",
     systemPrompt: "Stable companion rules",
+    promptDocuments: "Ordered Markdown documents",
     characterProfile: "Character profile",
     userProfile: "User profile",
     longTermMemories: "Relevant memories",
@@ -24,8 +24,8 @@ test("buildModelContext preserves stable, summary, and recent-message order", ()
   });
 
   assert.deepEqual(context, [
-    { role: "system", content: "Platform safety rules" },
     { role: "system", content: "Stable companion rules" },
+    { role: "system", content: "Ordered Markdown documents" },
     { role: "system", content: "Character profile" },
     { role: "system", content: "User profile" },
     { role: "system", content: "Relevant memories" },

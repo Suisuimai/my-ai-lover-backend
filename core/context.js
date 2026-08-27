@@ -31,8 +31,8 @@ function formatUserProfile(profile) {
 }
 
 function buildModelContext({
-  platformRules,
   systemPrompt,
+  promptDocuments,
   characterProfile,
   userProfile,
   followUps,
@@ -41,8 +41,8 @@ function buildModelContext({
   recentMessages,
 }) {
   return [
-    ...(platformRules ? [{ role: "system", content: platformRules }] : []),
     ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+    ...(promptDocuments ? [{ role: "system", content: promptDocuments }] : []),
     ...(characterProfile ? [{ role: "system", content: characterProfile }] : []),
     ...(userProfile ? [{ role: "system", content: userProfile }] : []),
     ...(followUps ? [{ role: "system", content: followUps }] : []),
