@@ -21,8 +21,15 @@ const { buildSemanticEventPrompt, parseSemanticEventDecision } = require("./core
 const {
   MAX_DOCUMENTS,
   MAX_DOCUMENT_CONTENT,
+  DOCUMENT_TYPES,
+  LOAD_MODES,
+  CONFIRMATION_STATUSES,
   formatPromptDocuments,
+  formatRetrievedPromptDocuments,
+  selectRelevantPromptDocuments,
 } = require("./core/promptDocuments");
+const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } = require("./core/timeline");
+const { formatWindowContinuity } = require("./core/handoff");
 const {
   FOLLOW_UP_KINDS,
   FOLLOW_UP_STATUSES,
@@ -338,6 +345,37 @@ async function loadPromptDocuments(userId, characterId) {
   return data || [];
 }
 
+async function loadRelevantTimeline(userId, characterId, currentMessage) {
+  const { data, error } = await supabase.from("timeline_entries").select("*")
+    .eq("user_id", userId).eq("character_id", characterId).eq("status", "active")
+    .order("occurred_at", { ascending: false }).limit(300);
+  if (error) throw error;
+  const selected = selectRelevantTimeline(data || [], currentMessage, 5);
+  if (selected.length) {
+    await Promise.all(selected.map((entry) => supabase.from("timeline_entries").update({
+      recall_count: (entry.recall_count || 0) + 1,
+      last_recalled_at: new Date().toISOString(),
+    }).eq("id", entry.id).eq("user_id", userId)));
+  }
+  return selected;
+}
+
+async function loadLatestWindowContinuity(userId, characterId) {
+  const { data: handoff, error } = await supabase.from("session_handoffs").select("*")
+    .eq("user_id", userId).eq("character_id", characterId)
+    .in("status", ["auto", "confirmed"])
+    .order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (error) throw error;
+  if (!handoff) return { handoff: null, tailMessages: [] };
+  const ids = handoff.tail_message_ids || [];
+  if (!ids.length) return { handoff, tailMessages: [] };
+  const { data: messages, error: messagesError } = await supabase.from("messages")
+    .select("id, role, content, created_at").in("id", ids)
+    .order("created_at", { ascending: true });
+  if (messagesError) throw messagesError;
+  return { handoff, tailMessages: messages || [] };
+}
+
 async function createSession(userId, name = DEFAULT_SESSION_NAME, characterId) {
   const character = characterId
     ? await getOwnedCharacter(characterId, userId)
@@ -616,6 +654,10 @@ app.post("/prompt-documents", async (req, res) => {
     const name = textUpdate(req.body, "name", 120);
     const content = textUpdate(req.body, "content", MAX_DOCUMENT_CONTENT);
     if (!name || !content) return res.status(400).json({ success: false, error: "Document name and Markdown content are required" });
+    const documentType = DOCUMENT_TYPES.has(req.body.documentType) ? req.body.documentType : "topic";
+    const loadMode = LOAD_MODES.has(req.body.loadMode) ? req.body.loadMode : "always";
+    const confirmationStatus = CONFIRMATION_STATUSES.has(req.body.confirmationStatus)
+      ? req.body.confirmationStatus : "confirmed";
     const nextOrder = existing.reduce((maximum, item) => Math.max(maximum, item.sort_order), -1) + 1;
     const { data, error } = await supabase.from("prompt_documents").insert({
       user_id: req.user.id,
@@ -623,7 +665,11 @@ app.post("/prompt-documents", async (req, res) => {
       name,
       content,
       sort_order: nextOrder,
-      is_enabled: req.body.isEnabled !== false,
+      is_enabled: loadMode !== "archive" && req.body.isEnabled !== false,
+      document_type: documentType,
+      load_mode: loadMode,
+      confirmation_status: confirmationStatus,
+      created_by: req.body.createdBy === "ai" ? "ai" : "user",
     }).select().single();
     if (error) throw error;
     res.status(201).json({ success: true, document: data });
@@ -638,7 +684,17 @@ app.patch("/prompt-documents/:documentId", async (req, res) => {
   const content = textUpdate(req.body, "content", MAX_DOCUMENT_CONTENT);
   if (name !== undefined) updates.name = name;
   if (content !== undefined) updates.content = content;
-  if (typeof req.body.isEnabled === "boolean") updates.is_enabled = req.body.isEnabled;
+  if (DOCUMENT_TYPES.has(req.body.documentType)) updates.document_type = req.body.documentType;
+  if (LOAD_MODES.has(req.body.loadMode)) {
+    updates.load_mode = req.body.loadMode;
+    updates.is_enabled = req.body.loadMode !== "archive";
+  } else if (typeof req.body.isEnabled === "boolean") {
+    updates.is_enabled = req.body.isEnabled;
+    updates.load_mode = req.body.isEnabled ? "always" : "archive";
+  }
+  if (CONFIRMATION_STATUSES.has(req.body.confirmationStatus)) {
+    updates.confirmation_status = req.body.confirmationStatus;
+  }
   if (updates.name === "" || updates.content === "") {
     return res.status(400).json({ success: false, error: "Document name and Markdown content cannot be empty" });
   }
@@ -680,6 +736,260 @@ app.delete("/prompt-documents/:documentId", async (req, res) => {
   if (error) return res.status(500).json({ success: false, error: error.message });
   if (!data) return res.status(404).json({ success: false, error: "Prompt document not found" });
   res.status(204).end();
+});
+
+app.get("/prompt-documents/:documentId/versions", async (req, res) => {
+  const { data: document, error: documentError } = await supabase.from("prompt_documents").select("id")
+    .eq("id", req.params.documentId).eq("user_id", req.user.id).maybeSingle();
+  if (documentError) return res.status(500).json({ success: false, error: documentError.message });
+  if (!document) return res.status(404).json({ success: false, error: "Prompt document not found" });
+  const { data, error } = await supabase.from("prompt_document_versions").select("*")
+    .eq("document_id", document.id).eq("user_id", req.user.id)
+    .order("version", { ascending: false });
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, versions: data || [] });
+});
+
+function limitedStrings(value, limit = 20, maxLength = 200) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => String(item || "").trim())
+    .filter(Boolean).map((item) => item.slice(0, maxLength)))].slice(0, limit);
+}
+
+async function ownedMessageIds(value, sessionId, limit = 20) {
+  const ids = limitedStrings(value, limit, 64);
+  if (!ids.length) return [];
+  if (!sessionId) {
+    const error = new Error("Source messages require an owned source session");
+    error.status = 400;
+    throw error;
+  }
+  const { data, error } = await supabase.from("messages").select("id")
+    .eq("session_id", sessionId).in("id", ids);
+  if (error) throw error;
+  if ((data || []).length !== ids.length) {
+    const ownershipError = new Error("Every source message must belong to the source session");
+    ownershipError.status = 400;
+    throw ownershipError;
+  }
+  return ids;
+}
+
+app.get("/timeline", async (req, res) => {
+  try {
+    const character = req.query.characterId
+      ? await getOwnedCharacter(req.query.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const { data, error } = await supabase.from("timeline_entries").select("*")
+      .eq("user_id", req.user.id).eq("character_id", character.id)
+      .neq("status", "deleted").order("occurred_at", { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, entries: data || [] });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/timeline", async (req, res) => {
+  try {
+    const character = req.body.characterId
+      ? await getOwnedCharacter(req.body.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const title = textUpdate(req.body, "title", 160);
+    const bodyMarkdown = textUpdate(req.body, "bodyMarkdown", 20000);
+    const currentState = textUpdate(req.body, "currentState", 3000);
+    const indexSummary = textUpdate(req.body, "indexSummary", 1200);
+    const evidenceTerms = normalizeEvidenceTerms(req.body.evidenceTerms, 12);
+    const occurredAt = req.body.occurredAt ? new Date(req.body.occurredAt) : new Date();
+    if (!title || !bodyMarkdown || !currentState || !indexSummary || !evidenceTerms.length
+        || Number.isNaN(occurredAt.getTime())) {
+      return res.status(400).json({ success: false, error: "Title, journal text, current state, index summary, evidence terms, and a valid time are required" });
+    }
+    let sourceSessionId = null;
+    if (req.body.sourceSessionId) {
+      const session = await requireOwnedSession(req.body.sourceSessionId, req.user.id);
+      if (session.character_id !== character.id) return res.status(400).json({ success: false, error: "Session and timeline entry use different companions" });
+      sourceSessionId = session.id;
+    }
+    const sourceMessageIds = await ownedMessageIds(req.body.sourceMessageIds, sourceSessionId, 20);
+    const { data, error } = await supabase.from("timeline_entries").insert({
+      user_id: req.user.id,
+      character_id: character.id,
+      source_session_id: sourceSessionId,
+      title,
+      body_markdown: bodyMarkdown,
+      current_state: currentState,
+      index_summary: indexSummary,
+      evidence_terms: evidenceTerms,
+      source_message_ids: sourceMessageIds,
+      occurred_at: occurredAt.toISOString(),
+      confirmation_status: req.body.confirmationStatus === "confirmed" ? "confirmed" : "auto",
+      created_by: req.body.createdBy === "user" ? "user" : "ai",
+    }).select().single();
+    if (error) throw error;
+    res.status(201).json({ success: true, entry: data });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.patch("/timeline/:entryId", async (req, res) => {
+  const updates = {};
+  for (const [bodyKey, column, max] of [
+    ["title", "title", 160], ["bodyMarkdown", "body_markdown", 20000],
+    ["currentState", "current_state", 3000], ["indexSummary", "index_summary", 1200],
+  ]) {
+    const value = textUpdate(req.body, bodyKey, max);
+    if (value !== undefined) updates[column] = value;
+  }
+  if (Array.isArray(req.body.evidenceTerms) || typeof req.body.evidenceTerms === "string") {
+    updates.evidence_terms = normalizeEvidenceTerms(req.body.evidenceTerms, 12);
+  }
+  if (["auto", "confirmed"].includes(req.body.confirmationStatus)) {
+    updates.confirmation_status = req.body.confirmationStatus;
+  }
+  if (req.body.occurredAt !== undefined) {
+    const occurredAt = new Date(req.body.occurredAt);
+    if (Number.isNaN(occurredAt.getTime())) return res.status(400).json({ success: false, error: "Invalid time" });
+    updates.occurred_at = occurredAt.toISOString();
+  }
+  if (!Object.keys(updates).length) return res.status(400).json({ success: false, error: "No timeline fields were provided" });
+  updates.updated_at = new Date().toISOString();
+  const { data, error } = await supabase.from("timeline_entries").update(updates)
+    .eq("id", req.params.entryId).eq("user_id", req.user.id).neq("status", "deleted")
+    .select().maybeSingle();
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (!data) return res.status(404).json({ success: false, error: "Timeline entry not found" });
+  res.json({ success: true, entry: data });
+});
+
+app.post("/timeline/:entryId/retract", async (req, res) => {
+  const quote = textUpdate(req.body, "quote", 2000);
+  const reason = textUpdate(req.body, "reason", 2000);
+  if (!quote || !reason) return res.status(400).json({ success: false, error: "An exact quote and reason are required" });
+  try {
+    const { data: entry, error: entryError } = await supabase.from("timeline_entries").select("*")
+      .eq("id", req.params.entryId).eq("user_id", req.user.id).eq("status", "active").maybeSingle();
+    if (entryError) throw entryError;
+    if (!entry) return res.status(404).json({ success: false, error: "Active timeline entry not found" });
+    if (!entry.body_markdown.includes(quote) && !entry.current_state.includes(quote)) {
+      return res.status(400).json({ success: false, error: "The quote must appear exactly in the journal text or current state" });
+    }
+    let replacementEntryId = null;
+    if (req.body.replacementEntryId) {
+      const { data: replacement, error: replacementError } = await supabase.from("timeline_entries").select("id")
+        .eq("id", req.body.replacementEntryId).eq("user_id", req.user.id)
+        .eq("character_id", entry.character_id).eq("status", "active").maybeSingle();
+      if (replacementError) throw replacementError;
+      if (!replacement) return res.status(400).json({ success: false, error: "Replacement entry must be an active journal for the same companion" });
+      replacementEntryId = replacement.id;
+    }
+    const { data: retraction, error: retractionError } = await supabase.from("timeline_retractions").insert({
+      user_id: req.user.id,
+      character_id: entry.character_id,
+      timeline_entry_id: entry.id,
+      replacement_entry_id: replacementEntryId,
+      quote,
+      reason,
+    }).select().single();
+    if (retractionError) throw retractionError;
+    const { data: updated, error: updateError } = await supabase.from("timeline_entries").update({
+      status: "retracted", updated_at: new Date().toISOString(),
+    }).eq("id", entry.id).eq("user_id", req.user.id).select().single();
+    if (updateError) {
+      await supabase.from("timeline_retractions").delete().eq("id", retraction.id).eq("user_id", req.user.id);
+      throw updateError;
+    }
+    res.json({ success: true, entry: updated, retraction });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete("/timeline/:entryId", async (req, res) => {
+  const { data, error } = await supabase.from("timeline_entries").update({
+    status: "deleted", updated_at: new Date().toISOString(),
+  }).eq("id", req.params.entryId).eq("user_id", req.user.id).select("id").maybeSingle();
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (!data) return res.status(404).json({ success: false, error: "Timeline entry not found" });
+  res.status(204).end();
+});
+
+app.get("/handoffs", async (req, res) => {
+  try {
+    const character = req.query.characterId
+      ? await getOwnedCharacter(req.query.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const { data, error } = await supabase.from("session_handoffs").select("*")
+      .eq("user_id", req.user.id).eq("character_id", character.id)
+      .order("created_at", { ascending: false }).limit(50);
+    if (error) throw error;
+    res.json({ success: true, handoffs: data || [] });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/handoffs", async (req, res) => {
+  try {
+    const sourceSessionId = typeof req.body.sourceSessionId === "string" ? req.body.sourceSessionId : "";
+    if (!sourceSessionId) return res.status(400).json({ success: false, error: "A source session is required" });
+    const session = await requireOwnedSession(sourceSessionId, req.user.id);
+    const character = session.character_id
+      ? await getOwnedCharacter(session.character_id, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const bodyMarkdown = textUpdate(req.body, "bodyMarkdown", 12000);
+    const currentState = textUpdate(req.body, "currentState", 3000);
+    if (!bodyMarkdown || !currentState) return res.status(400).json({ success: false, error: "Handoff text and current state are required" });
+    let tailMessageIds = await ownedMessageIds(req.body.tailMessageIds, sourceSessionId, 12);
+    if (!tailMessageIds.length) {
+      const { data: tail, error: tailError } = await supabase.from("messages").select("id")
+        .eq("session_id", sourceSessionId).eq("is_visible", true)
+        .order("created_at", { ascending: false }).limit(8);
+      if (tailError) throw tailError;
+      tailMessageIds = (tail || []).reverse().map((item) => item.id);
+    }
+    const { data, error } = await supabase.from("session_handoffs").insert({
+      user_id: req.user.id,
+      character_id: character.id,
+      source_session_id: sourceSessionId,
+      body_markdown: bodyMarkdown,
+      current_state: currentState,
+      topics: limitedStrings(req.body.topics, 20, 160),
+      open_loops: limitedStrings(req.body.openLoops, 20, 300),
+      continuation_guidance: textUpdate(req.body, "continuationGuidance", 3000) || "",
+      tail_message_ids: tailMessageIds,
+      status: req.body.status === "confirmed" ? "confirmed" : "auto",
+    }).select().single();
+    if (error) throw error;
+    await supabase.from("session_handoffs").update({ status: "superseded", updated_at: new Date().toISOString() })
+      .eq("user_id", req.user.id).eq("character_id", character.id)
+      .neq("id", data.id).in("status", ["auto", "confirmed"]);
+    res.status(201).json({ success: true, handoff: data });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.patch("/handoffs/:handoffId", async (req, res) => {
+  const updates = {};
+  for (const [bodyKey, column, max] of [
+    ["bodyMarkdown", "body_markdown", 12000], ["currentState", "current_state", 3000],
+    ["continuationGuidance", "continuation_guidance", 3000],
+  ]) {
+    const value = textUpdate(req.body, bodyKey, max);
+    if (value !== undefined) updates[column] = value;
+  }
+  if (Array.isArray(req.body.topics)) updates.topics = limitedStrings(req.body.topics, 20, 160);
+  if (Array.isArray(req.body.openLoops)) updates.open_loops = limitedStrings(req.body.openLoops, 20, 300);
+  if (["auto", "confirmed", "superseded"].includes(req.body.status)) updates.status = req.body.status;
+  if (!Object.keys(updates).length) return res.status(400).json({ success: false, error: "No handoff fields were provided" });
+  updates.updated_at = new Date().toISOString();
+  const { data, error } = await supabase.from("session_handoffs").update(updates)
+    .eq("id", req.params.handoffId).eq("user_id", req.user.id).select().maybeSingle();
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (!data) return res.status(404).json({ success: false, error: "Handoff not found" });
+  res.json({ success: true, handoff: data });
 });
 
 app.get("/memories", async (req, res) => {
