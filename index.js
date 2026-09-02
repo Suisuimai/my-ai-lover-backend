@@ -30,6 +30,7 @@ const {
 } = require("./core/promptDocuments");
 const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } = require("./core/timeline");
 const { formatWindowContinuity } = require("./core/handoff");
+const { normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
 const {
   FOLLOW_UP_KINDS,
   FOLLOW_UP_STATUSES,
@@ -59,6 +60,7 @@ const DEFAULT_SETTINGS = {
   context_token_threshold: 6000,
   recent_message_limit: 12,
   summary_model: "deepseek-v4-flash",
+  timeline_model: "deepseek-v4-flash",
 };
 const DEFAULT_SESSION_NAME = "New conversation";
 function encryptionKey() {
@@ -115,7 +117,7 @@ app.use(cors({
     callback(isAllowed ? null : new Error("Origin is not allowed by CORS"), isAllowed);
   },
 }));
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 async function requireUser(req, res, next) {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
@@ -137,6 +139,7 @@ function toSettings(settings) {
     contextTokenThreshold: settings.context_token_threshold,
     recentMessageLimit: settings.recent_message_limit,
     summaryModel: settings.summary_model,
+    timelineModel: settings.timeline_model || settings.summary_model,
   };
 }
 
@@ -775,6 +778,158 @@ async function ownedMessageIds(value, sessionId, limit = 20) {
   return ids;
 }
 
+app.get("/timeline-imports", async (req, res) => {
+  const { data, error } = await supabase.from("conversation_imports").select("*")
+    .eq("user_id", req.user.id).neq("status", "deleted").order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, imports: data || [] });
+});
+
+app.post("/timeline-imports", async (req, res) => {
+  let createdImport;
+  try {
+    const character = req.body.characterId ? await getOwnedCharacter(req.body.characterId, req.user.id) : await getOrCreateDefaultCharacter(req.user.id);
+    const messages = normalizeClaudeExport(req.body.exportData);
+    if (messages.length > 10000) return res.status(400).json({ success: false, error: "An export can contain at most 10,000 messages" });
+    const segments = segmentClaudeMessages(messages);
+    const title = String(req.body.exportData?.metadata?.title || req.body.sourceFilename || "Claude import").slice(0, 160);
+    const { data, error } = await supabase.from("conversation_imports").insert({
+      user_id: req.user.id, character_id: character.id, title,
+      source_filename: String(req.body.sourceFilename || "claude-export.json").slice(0, 255),
+      source_metadata: req.body.exportData?.metadata || {}, message_count: messages.length,
+      character_count: messages.reduce((sum, item) => sum + item.raw.length, 0), segment_count: segments.length,
+    }).select().single();
+    if (error) throw error;
+    createdImport = data;
+    const rows = segments.map((segment) => ({
+      import_id: data.id, user_id: req.user.id, character_id: character.id, sequence: segment.sequence,
+      started_at: segment.startedAt, ended_at: segment.endedAt, message_count: segment.messageCount,
+      character_count: segment.charCount, raw_messages: segment.rawMessages, cleaned_transcript: segment.transcript,
+    }));
+    const { data: savedSegments, error: segmentError } = await supabase.from("imported_conversation_segments").insert(rows).select("id,sequence,started_at,ended_at,message_count,character_count,status");
+    if (segmentError) throw segmentError;
+    res.status(201).json({ success: true, import: data, segments: savedSegments });
+  } catch (error) {
+    if (createdImport?.id) await supabase.from("conversation_imports").delete().eq("id", createdImport.id).eq("user_id", req.user.id);
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/timeline-imports/:importId/segments", async (req, res) => {
+  const { data, error } = await supabase.from("imported_conversation_segments")
+    .select("id,sequence,started_at,ended_at,message_count,character_count,status")
+    .eq("import_id", req.params.importId).eq("user_id", req.user.id).order("sequence");
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, segments: data || [] });
+});
+
+app.get("/timeline-segments/:segmentId", async (req, res) => {
+  const { data, error } = await supabase.from("imported_conversation_segments").select("*")
+    .eq("id", req.params.segmentId).eq("user_id", req.user.id).maybeSingle();
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (!data) return res.status(404).json({ success: false, error: "Imported segment not found" });
+  res.json({ success: true, segment: data });
+});
+
+app.post("/timeline-segments/:segmentId/generate", async (req, res) => {
+  try {
+    const { data: segment, error } = await supabase.from("imported_conversation_segments").select("*")
+      .eq("id", req.params.segmentId).eq("user_id", req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!segment) return res.status(404).json({ success: false, error: "Imported segment not found" });
+    const settings = await getSettings(req.user.id);
+    const model = settings.timeline_model || settings.summary_model;
+    const raw = await callModel({ model, userId: req.user.id, temperature: 0.1, maxTokens: 1800, messages: [
+      { role: "system", content: [
+        "You create documentary timeline candidates from an AI-companion conversation segment.",
+        "Return JSON only: {\"candidates\":[{\"title\":\"\",\"body_markdown\":\"\",\"current_state\":\"\",\"index_summary\":\"\",\"evidence_quotes\":[\"exact source quote\"],\"evidence_terms\":[\"\"]}]}",
+        "Create 0-4 candidates. Record only durable experiences, relationship developments, decisions, or meaningful current states.",
+        "Do not turn roleplay scenery, speculation, model analysis, or ordinary affectionate filler into real-world facts.",
+        "Every factual claim must be supported by exact evidence quotes copied from the source. State uncertainty explicitly.",
+        "current_state must describe how the matter stood at the END of this segment, not an earlier state.",
+      ].join("\n") },
+      { role: "user", content: `Segment time: ${segment.started_at} to ${segment.ended_at}\n\n${segment.cleaned_transcript}` },
+    ] });
+    const candidates = parseTimelineCandidates(raw, segment.cleaned_transcript);
+    await supabase.from("timeline_candidates").delete().eq("segment_id", segment.id).eq("user_id", req.user.id).eq("status", "suggested");
+    const rows = candidates.map((candidate) => ({
+      segment_id: segment.id, user_id: req.user.id, character_id: segment.character_id, model,
+      title: candidate.title, body_markdown: candidate.bodyMarkdown, current_state: candidate.currentState,
+      index_summary: candidate.indexSummary, evidence_quotes: candidate.evidenceQuotes,
+      evidence_terms: normalizeEvidenceTerms(candidate.evidenceTerms, 12),
+    }));
+    const { data: saved, error: saveError } = rows.length ? await supabase.from("timeline_candidates").insert(rows).select("*") : { data: [], error: null };
+    if (saveError) throw saveError;
+    await supabase.from("imported_conversation_segments").update({ status: "generated" }).eq("id", segment.id).eq("user_id", req.user.id);
+    res.json({ success: true, candidates: saved || [] });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/timeline-candidates", async (req, res) => {
+  const { data, error } = await supabase.from("timeline_candidates").select("*")
+    .eq("user_id", req.user.id).order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  res.json({ success: true, candidates: data || [] });
+});
+
+app.patch("/timeline-candidates/:candidateId", async (req, res) => {
+  try {
+    const { data: candidate, error } = await supabase.from("timeline_candidates").select("*, imported_conversation_segments(cleaned_transcript)")
+      .eq("id", req.params.candidateId).eq("user_id", req.user.id).eq("status", "suggested").maybeSingle();
+    if (error) throw error;
+    if (!candidate) return res.status(404).json({ success: false, error: "Suggested candidate not found" });
+    const updates = {};
+    for (const [bodyKey, column, max] of [["title","title",160],["bodyMarkdown","body_markdown",20000],["currentState","current_state",3000],["indexSummary","index_summary",1200]]) {
+      const value = textUpdate(req.body, bodyKey, max); if (value !== undefined) updates[column] = value;
+    }
+    if (Array.isArray(req.body.evidenceTerms) || typeof req.body.evidenceTerms === "string") updates.evidence_terms = normalizeEvidenceTerms(req.body.evidenceTerms, 12);
+    if (Array.isArray(req.body.evidenceQuotes)) {
+      const quotes = limitedStrings(req.body.evidenceQuotes, 6, 2000);
+      if (!quotes.length || quotes.some((quote) => !candidate.imported_conversation_segments.cleaned_transcript.includes(quote))) {
+        return res.status(400).json({ success: false, error: "Every evidence quote must exist exactly in the source segment" });
+      }
+      updates.evidence_quotes = quotes;
+    }
+    if (!Object.keys(updates).length) return res.status(400).json({ success: false, error: "No candidate fields were provided" });
+    if ([updates.title, updates.body_markdown, updates.current_state, updates.index_summary].some((value) => value === "")) return res.status(400).json({ success: false, error: "Candidate fields cannot be empty" });
+    const { data: saved, error: saveError } = await supabase.from("timeline_candidates").update(updates)
+      .eq("id", candidate.id).eq("user_id", req.user.id).select().single();
+    if (saveError) throw saveError;
+    res.json({ success: true, candidate: saved });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.post("/timeline-candidates/:candidateId/confirm", async (req, res) => {
+  try {
+    const { data: candidate, error } = await supabase.from("timeline_candidates").select("*, imported_conversation_segments(ended_at)")
+      .eq("id", req.params.candidateId).eq("user_id", req.user.id).eq("status", "suggested").maybeSingle();
+    if (error) throw error;
+    if (!candidate) return res.status(404).json({ success: false, error: "Suggested candidate not found" });
+    const { data: entry, error: entryError } = await supabase.from("timeline_entries").insert({
+      user_id: req.user.id, character_id: candidate.character_id, title: candidate.title,
+      body_markdown: candidate.body_markdown, current_state: candidate.current_state,
+      index_summary: candidate.index_summary, evidence_terms: candidate.evidence_terms,
+      occurred_at: candidate.imported_conversation_segments.ended_at, confirmation_status: "confirmed", created_by: "ai",
+    }).select().single();
+    if (entryError) throw entryError;
+    const { data: reviewed, error: reviewError } = await supabase.from("timeline_candidates").update({
+      status: "confirmed", timeline_entry_id: entry.id, reviewed_at: new Date().toISOString(),
+    }).eq("id", candidate.id).eq("user_id", req.user.id).select().single();
+    if (reviewError) { await supabase.from("timeline_entries").delete().eq("id", entry.id).eq("user_id", req.user.id); throw reviewError; }
+    res.json({ success: true, candidate: reviewed, entry });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.post("/timeline-candidates/:candidateId/reject", async (req, res) => {
+  const { data, error } = await supabase.from("timeline_candidates").update({ status: "rejected", reviewed_at: new Date().toISOString() })
+    .eq("id", req.params.candidateId).eq("user_id", req.user.id).eq("status", "suggested").select().maybeSingle();
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (!data) return res.status(404).json({ success: false, error: "Suggested candidate not found" });
+  res.json({ success: true, candidate: data });
+});
+
 app.get("/timeline", async (req, res) => {
   try {
     const character = req.query.characterId
@@ -1348,6 +1503,10 @@ app.patch("/settings", async (req, res) => {
   }
   if (typeof req.body.summaryModel === "string" && req.body.summaryModel.trim()) {
     updates.summary_model = req.body.summaryModel.trim();
+  }
+  if (typeof req.body.timelineModel === "string" && req.body.timelineModel.trim()) {
+    getModelProvider(req.body.timelineModel.trim());
+    updates.timeline_model = req.body.timelineModel.trim();
   }
 
   if (!Object.keys(updates).length) {
