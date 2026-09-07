@@ -149,7 +149,7 @@ function getModelProvider(model) {
   return { ...provider, apiKey: provider.apiKey() };
 }
 
-async function callModel({ model, messages, temperature, maxTokens, userId }) {
+async function callModel({ model, messages, temperature, maxTokens, userId, responseFormat }) {
   const provider = getModelProvider(model);
   if (userId) {
     const { data: credential } = await supabase.from("model_credentials").select("encrypted_key").eq("user_id", userId).eq("provider", provider.name).maybeSingle();
@@ -165,13 +165,22 @@ async function callModel({ model, messages, temperature, maxTokens, userId }) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${provider.apiKey}`,
       },
-      body: JSON.stringify({ model, temperature, max_tokens: maxTokens, messages }),
+      body: JSON.stringify({
+        model,
+        temperature,
+        max_tokens: maxTokens,
+        messages,
+        ...(responseFormat ? { response_format: { type: responseFormat } } : {}),
+      }),
     });
 
     const data = await response.json();
     if (!response.ok) throw new Error(data.error?.message || `${provider.name} request failed`);
     const text = data.choices?.[0]?.message?.content?.trim();
-    if (!text) throw new Error(`${provider.name} returned an empty reply`);
+    if (!text) {
+      const finishReason = data.choices?.[0]?.finish_reason || "unknown";
+      throw new Error(`${provider.name} returned an empty reply (finish_reason: ${finishReason})`);
+    }
     return text;
   }
 
@@ -844,7 +853,7 @@ app.post("/timeline-segments/:segmentId/generate", async (req, res) => {
     if (!segment) return res.status(404).json({ success: false, error: "Imported segment not found" });
     const settings = await getSettings(req.user.id);
     const model = settings.timeline_model || settings.summary_model;
-    const raw = await callModel({ model, userId: req.user.id, temperature: 0.1, maxTokens: 1800, messages: [
+    const raw = await callModel({ model, userId: req.user.id, temperature: 0.1, maxTokens: 1800, responseFormat: "json_object", messages: [
       { role: "system", content: [
         "You create documentary timeline candidates from an AI-companion conversation segment.",
         "Return JSON only: {\"candidates\":[{\"title\":\"\",\"body_markdown\":\"\",\"current_state\":\"\",\"index_summary\":\"\",\"evidence_quotes\":[\"exact source quote\"],\"evidence_terms\":[\"\"]}]}",
