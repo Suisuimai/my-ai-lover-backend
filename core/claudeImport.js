@@ -49,19 +49,52 @@ function segmentClaudeMessages(messages, gapMinutes = 30, maxChars = MAX_SEGMENT
   }));
 }
 
+function documentaryCharacters(value) {
+  return [...String(value || "").normalize("NFKC").toLocaleLowerCase()]
+    .filter((character) => /[\p{L}\p{N}]/u.test(character)).join("");
+}
+
+function resolveEvidenceQuote(transcript, quote) {
+  const source = String(transcript || "");
+  const requested = String(quote || "").trim();
+  if (!requested) return null;
+  const exactIndex = source.indexOf(requested);
+  if (exactIndex >= 0) return source.slice(exactIndex, exactIndex + requested.length);
+
+  const target = documentaryCharacters(requested);
+  if (target.length < 3) return null;
+  let normalized = "";
+  const starts = [];
+  const ends = [];
+  let offset = 0;
+  for (const originalCharacter of source) {
+    const folded = [...originalCharacter.normalize("NFKC").toLocaleLowerCase()]
+      .filter((character) => /[\p{L}\p{N}]/u.test(character));
+    for (const character of folded) {
+      normalized += character;
+      starts.push(offset);
+      ends.push(offset + originalCharacter.length);
+    }
+    offset += originalCharacter.length;
+  }
+  const normalizedIndex = normalized.indexOf(target);
+  if (normalizedIndex < 0) return null;
+  return source.slice(starts[normalizedIndex], ends[normalizedIndex + target.length - 1]).trim();
+}
+
 function parseTimelineCandidates(raw, transcript) {
   const match = String(raw || "").match(/\{[\s\S]*\}/);
   if (!match) throw new Error("Memory model did not return JSON");
   const parsed = JSON.parse(match[0]);
   if (!Array.isArray(parsed.candidates)) throw new Error("Memory model response has no candidates array");
   return parsed.candidates.slice(0, 4).map((item) => {
-    const evidenceQuotes = Array.isArray(item.evidence_quotes)
-      ? item.evidence_quotes.map((quote) => String(quote).trim()).filter(Boolean).slice(0, 6) : [];
+    const requestedQuotes = Array.isArray(item.evidence_quotes) ? item.evidence_quotes.slice(0, 6) : [];
+    const evidenceQuotes = requestedQuotes.map((quote) => resolveEvidenceQuote(transcript, quote)).filter(Boolean);
+    if (requestedQuotes.length && evidenceQuotes.length !== requestedQuotes.length) {
+      throw new Error("Memory model cited words that do not exist in the source segment");
+    }
     if (!item.title || !item.body_markdown || !item.current_state || !item.index_summary || !evidenceQuotes.length) {
       throw new Error("A candidate is missing required documentary fields");
-    }
-    if (evidenceQuotes.some((quote) => !transcript.includes(quote))) {
-      throw new Error("Memory model cited words that do not exist in the source segment");
     }
     return {
       title: String(item.title).slice(0, 160), bodyMarkdown: String(item.body_markdown).slice(0, 20000),
