@@ -817,10 +817,15 @@ app.post("/timeline-imports", async (req, res) => {
 
 app.get("/timeline-imports/:importId/segments", async (req, res) => {
   const { data, error } = await supabase.from("imported_conversation_segments")
-    .select("id,sequence,started_at,ended_at,message_count,character_count,status")
+    .select("id,sequence,started_at,ended_at,message_count,character_count,status,timeline_candidates(id,status)")
     .eq("import_id", req.params.importId).eq("user_id", req.user.id).order("sequence");
   if (error) return res.status(500).json({ success: false, error: error.message });
-  res.json({ success: true, segments: data || [] });
+  res.json({ success: true, segments: (data || []).map((segment) => ({
+    ...segment,
+    candidateCount: (segment.timeline_candidates || []).length,
+    suggestedCount: (segment.timeline_candidates || []).filter((candidate) => candidate.status === "suggested").length,
+    timeline_candidates: undefined,
+  })) });
 });
 
 app.get("/timeline-segments/:segmentId", async (req, res) => {
@@ -861,7 +866,7 @@ app.post("/timeline-segments/:segmentId/generate", async (req, res) => {
     const { data: saved, error: saveError } = rows.length ? await supabase.from("timeline_candidates").insert(rows).select("*") : { data: [], error: null };
     if (saveError) throw saveError;
     await supabase.from("imported_conversation_segments").update({ status: "generated" }).eq("id", segment.id).eq("user_id", req.user.id);
-    res.json({ success: true, candidates: saved || [] });
+    res.json({ success: true, candidates: saved || [], candidateCount: (saved || []).length });
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });
   }
@@ -1754,21 +1759,10 @@ app.post("/chat", async (req, res) => {
       title,
       reply,
       messageId: assistantMessage.id,
-      memoryCapture: explicitMemory ? (capturedMemoryId ? "saved" : "failed") : "automatic_pending",
+      memoryCapture: explicitMemory ? (capturedMemoryId ? "saved" : "failed") : "automatic_disabled",
       followUpCapture,
       followUpStatusSuggestion,
     });
-    if (!explicitMemory && (!followUpStatusSuggestion || followUpStatusSuggestion.suggestedStatus === "completed")) {
-      extractLongTermMemories({
-        userId: req.user.id,
-        character,
-        userProfile,
-        sessionId,
-        message,
-        reply,
-        settings,
-      }).catch((memoryError) => console.error("Long-term memory extraction failed:", memoryError));
-    }
   } catch (error) {
     console.error("Chat failed:", error);
     res.status(500).json({ success: false, error: error.message, reply: "Sorry, I could not reply just now." });
