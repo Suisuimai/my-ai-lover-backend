@@ -30,7 +30,7 @@ const {
 } = require("./core/promptDocuments");
 const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } = require("./core/timeline");
 const { formatWindowContinuity } = require("./core/handoff");
-const { normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
+const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
 const {
   FOLLOW_UP_KINDS,
   FOLLOW_UP_STATUSES,
@@ -854,6 +854,12 @@ app.post("/timeline-segments/:segmentId/generate", async (req, res) => {
     if (!segment) return res.status(404).json({ success: false, error: "Imported segment not found" });
     const settings = await getSettings(req.user.id);
     const model = settings.timeline_model || settings.summary_model;
+    const sourceMessages = (segment.raw_messages || []).map((message) => ({
+      role: message.role,
+      content: cleanClaudeSay(message.role, message.content),
+    }));
+    const numberedTranscript = sourceMessages.map((message, index) =>
+      `[M${index + 1}] ${message.role === "user" ? "User" : "Companion"}: ${message.content}`).join("\n\n");
     const raw = await callModel({
       model,
       userId: req.user.id,
@@ -864,16 +870,16 @@ app.post("/timeline-segments/:segmentId/generate", async (req, res) => {
       messages: [
       { role: "system", content: [
         "You create documentary timeline candidates from an AI-companion conversation segment.",
-        "Return JSON only: {\"candidates\":[{\"title\":\"\",\"body_markdown\":\"\",\"current_state\":\"\",\"index_summary\":\"\",\"evidence_quotes\":[\"exact source quote\"],\"evidence_terms\":[\"\"]}]}",
+        "Return JSON only: {\"candidates\":[{\"title\":\"\",\"body_markdown\":\"\",\"current_state\":\"\",\"index_summary\":\"\",\"evidence_message_numbers\":[1,2],\"evidence_terms\":[\"\"]}]}",
         "Create 0-4 candidates. Record only durable experiences, relationship developments, decisions, or meaningful current states.",
         "Do not turn roleplay scenery, speculation, model analysis, or ordinary affectionate filler into real-world facts.",
-        "Every factual claim must be supported by exact evidence quotes copied from the source. State uncertainty explicitly.",
+        "Every factual claim must be supported by evidence_message_numbers that refer to the numbered source messages. Never copy or rewrite evidence text yourself.",
         "current_state must describe how the matter stood at the END of this segment, not an earlier state.",
       ].join("\n") },
-      { role: "user", content: `Segment time: ${segment.started_at} to ${segment.ended_at}\n\n${segment.cleaned_transcript}` },
+      { role: "user", content: `Segment time: ${segment.started_at} to ${segment.ended_at}\n\n${numberedTranscript}` },
       ],
     });
-    const candidates = parseTimelineCandidates(raw, segment.cleaned_transcript);
+    const candidates = parseTimelineCandidates(raw, numberedTranscript, sourceMessages);
     await supabase.from("timeline_candidates").delete().eq("segment_id", segment.id).eq("user_id", req.user.id).eq("status", "suggested");
     const rows = candidates.map((candidate) => ({
       segment_id: segment.id, user_id: req.user.id, character_id: segment.character_id, model,
