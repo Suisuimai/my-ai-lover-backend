@@ -149,7 +149,7 @@ function getModelProvider(model) {
   return { ...provider, apiKey: provider.apiKey() };
 }
 
-async function callModel({ model, messages, temperature, maxTokens, userId, responseFormat }) {
+async function callModel({ model, messages, temperature, maxTokens, userId, responseFormat, thinking }) {
   const provider = getModelProvider(model);
   if (userId) {
     const { data: credential } = await supabase.from("model_credentials").select("encrypted_key").eq("user_id", userId).eq("provider", provider.name).maybeSingle();
@@ -171,6 +171,7 @@ async function callModel({ model, messages, temperature, maxTokens, userId, resp
         max_tokens: maxTokens,
         messages,
         ...(responseFormat ? { response_format: { type: responseFormat } } : {}),
+        ...(provider.name === "deepseek" && thinking ? { thinking: { type: thinking } } : {}),
       }),
     });
 
@@ -853,7 +854,14 @@ app.post("/timeline-segments/:segmentId/generate", async (req, res) => {
     if (!segment) return res.status(404).json({ success: false, error: "Imported segment not found" });
     const settings = await getSettings(req.user.id);
     const model = settings.timeline_model || settings.summary_model;
-    const raw = await callModel({ model, userId: req.user.id, temperature: 0.1, maxTokens: 1800, responseFormat: "json_object", messages: [
+    const raw = await callModel({
+      model,
+      userId: req.user.id,
+      temperature: 0.1,
+      maxTokens: 2600,
+      responseFormat: "json_object",
+      thinking: "disabled",
+      messages: [
       { role: "system", content: [
         "You create documentary timeline candidates from an AI-companion conversation segment.",
         "Return JSON only: {\"candidates\":[{\"title\":\"\",\"body_markdown\":\"\",\"current_state\":\"\",\"index_summary\":\"\",\"evidence_quotes\":[\"exact source quote\"],\"evidence_terms\":[\"\"]}]}",
@@ -863,7 +871,8 @@ app.post("/timeline-segments/:segmentId/generate", async (req, res) => {
         "current_state must describe how the matter stood at the END of this segment, not an earlier state.",
       ].join("\n") },
       { role: "user", content: `Segment time: ${segment.started_at} to ${segment.ended_at}\n\n${segment.cleaned_transcript}` },
-    ] });
+      ],
+    });
     const candidates = parseTimelineCandidates(raw, segment.cleaned_transcript);
     await supabase.from("timeline_candidates").delete().eq("segment_id", segment.id).eq("user_id", req.user.id).eq("status", "suggested");
     const rows = candidates.map((candidate) => ({
