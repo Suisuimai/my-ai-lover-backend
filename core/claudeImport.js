@@ -82,16 +82,26 @@ function resolveEvidenceQuote(transcript, quote) {
   return source.slice(starts[normalizedIndex], ends[normalizedIndex + target.length - 1]).trim();
 }
 
-function parseTimelineCandidates(raw, transcript) {
+function parseTimelineCandidates(raw, transcript, sourceMessages = []) {
   const match = String(raw || "").match(/\{[\s\S]*\}/);
   if (!match) throw new Error("Memory model did not return JSON");
   const parsed = JSON.parse(match[0]);
   if (!Array.isArray(parsed.candidates)) throw new Error("Memory model response has no candidates array");
   return parsed.candidates.slice(0, 4).map((item) => {
-    const requestedQuotes = Array.isArray(item.evidence_quotes) ? item.evidence_quotes.slice(0, 6) : [];
-    const evidenceQuotes = requestedQuotes.map((quote) => resolveEvidenceQuote(transcript, quote)).filter(Boolean);
-    if (requestedQuotes.length && evidenceQuotes.length !== requestedQuotes.length) {
-      throw new Error("Memory model cited words that do not exist in the source segment");
+    const evidenceNumbers = Array.isArray(item.evidence_message_numbers)
+      ? [...new Set(item.evidence_message_numbers.filter(Number.isInteger))].slice(0, 6) : [];
+    let evidenceQuotes;
+    if (sourceMessages.length) {
+      if (!evidenceNumbers.length || evidenceNumbers.some((number) => number < 1 || number > sourceMessages.length)) {
+        throw new Error("Memory model cited invalid source message numbers");
+      }
+      evidenceQuotes = evidenceNumbers.map((number) => String(sourceMessages[number - 1].content || "").trim().slice(0, 2000)).filter(Boolean);
+    } else {
+      const requestedQuotes = Array.isArray(item.evidence_quotes) ? item.evidence_quotes.slice(0, 6) : [];
+      evidenceQuotes = requestedQuotes.map((quote) => resolveEvidenceQuote(transcript, quote)).filter(Boolean);
+      if (requestedQuotes.length && evidenceQuotes.length !== requestedQuotes.length) {
+        throw new Error("Memory model cited words that do not exist in the source segment");
+      }
     }
     if (!item.title || !item.body_markdown || !item.current_state || !item.index_summary || !evidenceQuotes.length) {
       throw new Error("A candidate is missing required documentary fields");
