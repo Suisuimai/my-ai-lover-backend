@@ -31,6 +31,7 @@ const {
 const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } = require("./core/timeline");
 const { formatWindowContinuity } = require("./core/handoff");
 const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
+const { apiErrorCode, normalizeModelUsage } = require("./core/apiUsage");
 const {
   FOLLOW_UP_KINDS,
   FOLLOW_UP_STATUSES,
@@ -149,71 +150,134 @@ function getModelProvider(model) {
   return { ...provider, apiKey: provider.apiKey() };
 }
 
-async function callModel({ model, messages, temperature, maxTokens, userId, responseFormat, thinking }) {
-  const provider = getModelProvider(model);
-  if (userId) {
-    const { data: credential } = await supabase.from("model_credentials").select("encrypted_key").eq("user_id", userId).eq("provider", provider.name).maybeSingle();
-    if (credential?.encrypted_key) provider.apiKey = decryptSecret(credential.encrypted_key);
+async function recordModelUsage(event) {
+  try {
+    const { error } = await supabase.from("api_usage_events").insert(event);
+    if (error) console.error("API usage ledger write failed:", error.code || "database_error");
+  } catch {
+    console.error("API usage ledger write failed: unexpected_error");
   }
-  if (!provider.apiKey) throw new Error(`${provider.name} API key is not configured. Add it in Settings.`);
-  let response;
+}
 
-  if (provider.type === "openai-compatible") {
+async function callModel({ model, messages, temperature, maxTokens, userId, responseFormat, thinking, purpose = "unspecified" }) {
+  const startedAt = new Date();
+  const startedClock = Date.now();
+  let provider;
+  let response;
+  let responseData = {};
+  let status = "failed";
+  let errorCode = null;
+  let resolvedModel = null;
+  let providerRequestId = null;
+
+  try {
+    provider = getModelProvider(model);
+    if (userId) {
+      const { data: credential } = await supabase.from("model_credentials").select("encrypted_key").eq("user_id", userId).eq("provider", provider.name).maybeSingle();
+      if (credential?.encrypted_key) provider.apiKey = decryptSecret(credential.encrypted_key);
+    }
+    if (!provider.apiKey) throw new Error(`${provider.name} API key is not configured. Add it in Settings.`);
+
+    if (provider.type === "openai-compatible") {
+      response = await fetch(provider.endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${provider.apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          temperature,
+          max_tokens: maxTokens,
+          messages,
+          ...(responseFormat ? { response_format: { type: responseFormat } } : {}),
+          ...(provider.name === "deepseek" && thinking ? { thinking: { type: thinking } } : {}),
+        }),
+      });
+
+      responseData = await response.json();
+      errorCode = apiErrorCode(responseData, response.status);
+      if (!response.ok) throw new Error(responseData.error?.message || `${provider.name} request failed`);
+      const text = responseData.choices?.[0]?.message?.content?.trim();
+      if (!text) {
+        const finishReason = responseData.choices?.[0]?.finish_reason || "unknown";
+        throw new Error(`${provider.name} returned an empty reply (finish_reason: ${finishReason})`);
+      }
+      status = "succeeded";
+      errorCode = null;
+      resolvedModel = responseData.model || model;
+      providerRequestId = responseData.id || response.headers.get("x-request-id");
+      return text;
+    }
+
+    const system = messages
+      .filter((message) => message.role === "system")
+      .map((message) => message.content)
+      .join("\n\n");
+    const conversation = messages
+      .filter((message) => message.role !== "system")
+      .map(({ role, content }) => ({ role, content }));
+
     response = await fetch(provider.endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${provider.apiKey}`,
+        "x-api-key": provider.apiKey,
+        "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
         model,
+        system,
         temperature,
         max_tokens: maxTokens,
-        messages,
-        ...(responseFormat ? { response_format: { type: responseFormat } } : {}),
-        ...(provider.name === "deepseek" && thinking ? { thinking: { type: thinking } } : {}),
+        messages: conversation,
       }),
     });
 
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error?.message || `${provider.name} request failed`);
-    const text = data.choices?.[0]?.message?.content?.trim();
-    if (!text) {
-      const finishReason = data.choices?.[0]?.finish_reason || "unknown";
-      throw new Error(`${provider.name} returned an empty reply (finish_reason: ${finishReason})`);
-    }
+    responseData = await response.json();
+    errorCode = apiErrorCode(responseData, response.status);
+    if (!response.ok) throw new Error(responseData.error?.message || "Anthropic request failed");
+    const text = responseData.content?.filter((part) => part.type === "text").map((part) => part.text).join("").trim();
+    if (!text) throw new Error("Anthropic returned an empty reply");
+    status = "succeeded";
+    errorCode = null;
+    resolvedModel = responseData.model || model;
+    providerRequestId = responseData.id || response.headers.get("request-id");
     return text;
+  } finally {
+    if (userId) {
+      const usage = normalizeModelUsage(provider?.name, responseData);
+      await recordModelUsage({
+        user_id: userId,
+        purpose,
+        provider: provider?.name || null,
+        requested_model: model,
+        resolved_model: resolvedModel,
+        status,
+        http_status: response?.status || null,
+        error_code: status === "failed"
+          ? (errorCode || (response?.status ? `http_${response.status}` : "local_error"))
+          : null,
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        total_tokens: usage.totalTokens,
+        cache_read_tokens: usage.cacheReadTokens,
+        cache_write_tokens: usage.cacheWriteTokens,
+        cache_write_1h_tokens: usage.cacheWrite1hTokens,
+        cache_hit_tokens: usage.cacheHitTokens,
+        cache_miss_tokens: usage.cacheMissTokens,
+        reasoning_tokens: usage.reasoningTokens,
+        provider_cost: usage.providerCost,
+        cost_currency: usage.costCurrency,
+        cost_source: usage.costSource,
+        duration_ms: Math.max(0, Date.now() - startedClock),
+        provider_request_id: providerRequestId,
+        started_at: startedAt.toISOString(),
+        completed_at: new Date().toISOString(),
+        provider_usage: usage.providerUsage,
+      });
+    }
   }
-
-  const system = messages
-    .filter((message) => message.role === "system")
-    .map((message) => message.content)
-    .join("\n\n");
-  const conversation = messages
-    .filter((message) => message.role !== "system")
-    .map(({ role, content }) => ({ role, content }));
-
-  response = await fetch(provider.endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": provider.apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model,
-      system,
-      temperature,
-      max_tokens: maxTokens,
-      messages: conversation,
-    }),
-  });
-
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error?.message || "Anthropic request failed");
-  const text = data.content?.filter((part) => part.type === "text").map((part) => part.text).join("").trim();
-  if (!text) throw new Error("Anthropic returned an empty reply");
-  return text;
 }
 
 async function maybeCompressMemory(sessionId, settings, userId) {
@@ -254,6 +318,7 @@ async function maybeCompressMemory(sessionId, settings, userId) {
     .map(({ role, content }) => `${role}: ${content}`)
     .join("\n");
   const summary = await callModel({
+    purpose: "conversation_summary",
     model: settings.summary_model,
     temperature: 0.2,
     maxTokens: 500,
@@ -425,6 +490,7 @@ async function createTitle(model, message, reply, userId) {
 
   try {
     return (await callModel({
+      purpose: "conversation_title",
       model,
       temperature: 0.3,
       maxTokens: 20,
@@ -469,6 +535,7 @@ async function interpretSemanticEvent({ userId, settings, message, recentMessage
     timeZone: "Asia/Shanghai", dateStyle: "short", timeStyle: "medium",
   }).format(new Date()) + " Asia/Shanghai";
   const raw = await callModel({
+    purpose: "followup_interpretation",
     model: settings.summary_model,
     temperature: 0,
     maxTokens: 450,
@@ -503,6 +570,7 @@ async function extractLongTermMemories({ userId, character, userProfile, session
   ].join("\n\n");
 
   const raw = await callModel({
+    purpose: "long_term_memory_extraction",
     model: settings.summary_model,
     temperature: 0.1,
     maxTokens: 350,
@@ -861,6 +929,7 @@ app.post("/timeline-segments/:segmentId/generate", async (req, res) => {
     const numberedTranscript = sourceMessages.map((message, index) =>
       `[M${index + 1}] ${message.role === "user" ? "User" : "Companion"}: ${message.content}`).join("\n\n");
     const raw = await callModel({
+      purpose: "timeline_generation",
       model,
       userId: req.user.id,
       temperature: 0.1,
@@ -1714,6 +1783,7 @@ app.post("/chat", async (req, res) => {
       : settings.model;
     const [reply, semanticEventSuggestion] = await Promise.all([
       callModel({
+        purpose: "companion_chat",
         model: requestedModel,
         temperature: settings.temperature,
         maxTokens: settings.max_tokens,

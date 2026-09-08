@@ -17,3 +17,6 @@ blindly: the security migration intentionally deletes legacy demo sessions.
 
 The first V2 migration will bind existing sessions to a default character
 without deleting messages or `session_memories`.
+
+Current latest migration: `009_api_usage_ledger.sql`, which adds the server-written
+model-call ledger without storing prompts, responses, or API keys.
