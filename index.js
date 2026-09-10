@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const dns = require("node:dns").promises;
 const { createClient } = require("@supabase/supabase-js");
 const {
   buildModelContext,
@@ -32,6 +33,15 @@ const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } 
 const { formatWindowContinuity } = require("./core/handoff");
 const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
 const { apiErrorCode, normalizeModelUsage } = require("./core/apiUsage");
+const {
+  API_FORMATS,
+  FEATURE_PURPOSES,
+  connectionKind,
+  isPrivateIp,
+  modelEndpoint,
+  normalizeBaseUrl,
+  safeConnectionView,
+} = require("./core/apiConnections");
 const {
   FOLLOW_UP_KINDS,
   FOLLOW_UP_STATUSES,
@@ -150,6 +160,54 @@ function getModelProvider(model) {
   return { ...provider, apiKey: provider.apiKey() };
 }
 
+function isMissingApiFoundation(error) {
+  return ["42P01", "42703", "PGRST204", "PGRST205"].includes(error?.code);
+}
+
+async function getModelTarget({ userId, purpose, legacyModel }) {
+  if (userId && FEATURE_PURPOSES.has(purpose)) {
+    const { data: route, error: routeError } = await supabase.from("api_feature_routes")
+      .select("connection_id,model_id,enabled")
+      .eq("user_id", userId).eq("purpose", purpose).maybeSingle();
+    if (routeError && !isMissingApiFoundation(routeError)) throw routeError;
+
+    if (route?.enabled) {
+      const { data: connection, error: connectionError } = await supabase.from("api_connections")
+        .select("id,label,base_url,encrypted_key,api_format,enabled,legacy_provider")
+        .eq("id", route.connection_id).eq("user_id", userId).maybeSingle();
+      if (connectionError && !isMissingApiFoundation(connectionError)) throw connectionError;
+      if (connection?.enabled) {
+        return {
+          name: connectionKind(connection),
+          type: connection.api_format === "anthropic" ? "anthropic" : "openai-compatible",
+          endpoint: modelEndpoint(connection.base_url, connection.api_format),
+          apiKey: decryptSecret(connection.encrypted_key),
+          connectionId: connection.id,
+          model: route.model_id,
+        };
+      }
+    }
+  }
+
+  const provider = getModelProvider(legacyModel);
+  if (userId) {
+    const { data: credential } = await supabase.from("model_credentials").select("encrypted_key")
+      .eq("user_id", userId).eq("provider", provider.name).maybeSingle();
+    if (credential?.encrypted_key) provider.apiKey = decryptSecret(credential.encrypted_key);
+  }
+  return { ...provider, connectionId: null, model: legacyModel };
+}
+
+async function validatePublicConnectionUrl(value) {
+  const baseUrl = normalizeBaseUrl(value);
+  const hostname = new URL(baseUrl).hostname.replace(/^\[|\]$/g, "");
+  const addresses = await dns.lookup(hostname, { all: true, verbatim: true });
+  if (!addresses.length || addresses.some(({ address }) => isPrivateIp(address))) {
+    throw new Error("Connection URL resolves to a local or private address");
+  }
+  return baseUrl;
+}
+
 async function recordModelUsage(event) {
   try {
     const { error } = await supabase.from("api_usage_events").insert(event);
@@ -171,16 +229,14 @@ async function callModel({ model, messages, temperature, maxTokens, userId, resp
   let providerRequestId = null;
 
   try {
-    provider = getModelProvider(model);
-    if (userId) {
-      const { data: credential } = await supabase.from("model_credentials").select("encrypted_key").eq("user_id", userId).eq("provider", provider.name).maybeSingle();
-      if (credential?.encrypted_key) provider.apiKey = decryptSecret(credential.encrypted_key);
-    }
+    provider = await getModelTarget({ userId, purpose, legacyModel: model });
+    model = provider.model;
     if (!provider.apiKey) throw new Error(`${provider.name} API key is not configured. Add it in Settings.`);
 
     if (provider.type === "openai-compatible") {
       response = await fetch(provider.endpoint, {
         method: "POST",
+        redirect: "error",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${provider.apiKey}`,
@@ -220,6 +276,7 @@ async function callModel({ model, messages, temperature, maxTokens, userId, resp
 
     response = await fetch(provider.endpoint, {
       method: "POST",
+      redirect: "error",
       headers: {
         "Content-Type": "application/json",
         "x-api-key": provider.apiKey,
@@ -249,6 +306,7 @@ async function callModel({ model, messages, temperature, maxTokens, userId, resp
       const usage = normalizeModelUsage(provider?.name, responseData);
       await recordModelUsage({
         user_id: userId,
+        connection_id: provider?.connectionId || null,
         purpose,
         provider: provider?.name || null,
         requested_model: model,
@@ -494,6 +552,7 @@ async function createTitle(model, message, reply, userId) {
       model,
       temperature: 0.3,
       maxTokens: 20,
+      thinking: "disabled",
       userId,
       messages: [{
         role: "user",
@@ -1622,6 +1681,169 @@ app.patch("/settings", async (req, res) => {
 
     if (error) throw error;
     res.json({ success: true, settings: toSettings(data) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// User-defined API connections. Secrets remain write-only and server-side.
+app.get("/api-connections", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("api_connections").select("*")
+      .eq("user_id", req.user.id).order("created_at", { ascending: true });
+    if (error) throw error;
+    res.json({ success: true, connections: (data || []).map(safeConnectionView) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/api-connections", async (req, res) => {
+  const label = textUpdate(req.body, "label", 80);
+  const apiKey = typeof req.body.apiKey === "string" ? req.body.apiKey.trim() : "";
+  const apiFormat = typeof req.body.apiFormat === "string" ? req.body.apiFormat : "";
+  if (!label || !apiKey || !API_FORMATS.has(apiFormat)) {
+    return res.status(400).json({ success: false, error: "Name, API key, and a supported API format are required" });
+  }
+  try {
+    const baseUrl = await validatePublicConnectionUrl(req.body.baseUrl);
+    const { data, error } = await supabase.from("api_connections").insert({
+      user_id: req.user.id,
+      label,
+      base_url: baseUrl,
+      encrypted_key: encryptSecret(apiKey),
+      api_format: apiFormat,
+      notes: textUpdate(req.body, "notes", 1000) || "",
+      enabled: req.body.enabled !== false,
+    }).select().single();
+    if (error) throw error;
+    res.status(201).json({ success: true, connection: safeConnectionView(data) });
+  } catch (error) {
+    const status = error.code === "23505" ? 409 : (/^Connection URL/.test(error.message) ? 400 : 500);
+    res.status(status).json({ success: false, error: status === 409 ? "A connection with this name already exists" : error.message });
+  }
+});
+
+app.patch("/api-connections/:connectionId", async (req, res) => {
+  try {
+    const { data: current, error: currentError } = await supabase.from("api_connections").select("*")
+      .eq("id", req.params.connectionId).eq("user_id", req.user.id).maybeSingle();
+    if (currentError) throw currentError;
+    if (!current) return res.status(404).json({ success: false, error: "Connection not found" });
+
+    const updates = { updated_at: new Date().toISOString() };
+    const label = textUpdate(req.body, "label", 80);
+    const notes = textUpdate(req.body, "notes", 1000);
+    if (label !== undefined) {
+      if (!label) return res.status(400).json({ success: false, error: "Connection name cannot be empty" });
+      updates.label = label;
+    }
+    if (notes !== undefined) updates.notes = notes;
+    if (typeof req.body.enabled === "boolean") updates.enabled = req.body.enabled;
+    if (typeof req.body.apiFormat === "string") {
+      if (!API_FORMATS.has(req.body.apiFormat)) return res.status(400).json({ success: false, error: "Unsupported API format" });
+      updates.api_format = req.body.apiFormat;
+    }
+    if (req.body.baseUrl !== undefined) updates.base_url = await validatePublicConnectionUrl(req.body.baseUrl);
+    if (req.body.apiKey !== undefined) {
+      const apiKey = typeof req.body.apiKey === "string" ? req.body.apiKey.trim() : "";
+      if (!apiKey) return res.status(400).json({ success: false, error: "API key cannot be empty" });
+      updates.encrypted_key = encryptSecret(apiKey);
+    }
+
+    const { data, error } = await supabase.from("api_connections").update(updates)
+      .eq("id", current.id).eq("user_id", req.user.id).select().single();
+    if (error) throw error;
+    res.json({ success: true, connection: safeConnectionView(data) });
+  } catch (error) {
+    const status = error.code === "23505" ? 409 : (/^Connection URL/.test(error.message) ? 400 : 500);
+    res.status(status).json({ success: false, error: status === 409 ? "A connection with this name already exists" : error.message });
+  }
+});
+
+app.delete("/api-connections/:connectionId", async (req, res) => {
+  try {
+    const { count, error: routeError } = await supabase.from("api_feature_routes")
+      .select("purpose", { count: "exact", head: true })
+      .eq("user_id", req.user.id).eq("connection_id", req.params.connectionId);
+    if (routeError) throw routeError;
+    if (count) return res.status(409).json({ success: false, error: "Move assigned features before deleting this connection" });
+    const { data, error } = await supabase.from("api_connections").delete()
+      .eq("id", req.params.connectionId).eq("user_id", req.user.id).select("id").maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ success: false, error: "Connection not found" });
+    res.status(204).end();
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/api-feature-routes", async (req, res) => {
+  try {
+    const [{ data: routes, error: routeError }, { data: connections, error: connectionError }] = await Promise.all([
+      supabase.from("api_feature_routes").select("purpose,connection_id,model_id,follows_purpose,enabled,updated_at")
+        .eq("user_id", req.user.id).order("purpose"),
+      supabase.from("api_connections").select("id,label").eq("user_id", req.user.id),
+    ]);
+    if (routeError) throw routeError;
+    if (connectionError) throw connectionError;
+    const labels = new Map((connections || []).map((connection) => [connection.id, connection.label]));
+    res.json({ success: true, routes: (routes || []).map((route) => ({
+      purpose: route.purpose,
+      connectionId: route.connection_id,
+      connectionLabel: labels.get(route.connection_id) || "Unknown connection",
+      modelId: route.model_id,
+      followsPurpose: route.follows_purpose,
+      enabled: route.enabled,
+      updatedAt: route.updated_at,
+    })) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put("/api-feature-routes/:purpose", async (req, res) => {
+  const purpose = req.params.purpose;
+  const followsPurpose = typeof req.body.followsPurpose === "string" ? req.body.followsPurpose : null;
+  if (!FEATURE_PURPOSES.has(purpose) || (followsPurpose && (!FEATURE_PURPOSES.has(followsPurpose) || followsPurpose === purpose))) {
+    return res.status(400).json({ success: false, error: "Unsupported feature assignment" });
+  }
+  try {
+    let connectionId = typeof req.body.connectionId === "string" ? req.body.connectionId : "";
+    let modelId = typeof req.body.modelId === "string" ? req.body.modelId.trim().slice(0, 300) : "";
+
+    if (followsPurpose) {
+      const { data: source, error } = await supabase.from("api_feature_routes")
+        .select("connection_id,model_id,follows_purpose,enabled")
+        .eq("user_id", req.user.id).eq("purpose", followsPurpose).maybeSingle();
+      if (error) throw error;
+      if (!source?.enabled || source.follows_purpose) {
+        return res.status(400).json({ success: false, error: "A feature can only follow a direct, enabled assignment" });
+      }
+      connectionId = source.connection_id;
+      modelId = source.model_id;
+    }
+
+    if (!connectionId || !modelId) return res.status(400).json({ success: false, error: "Connection and model are required" });
+    const { data: connection, error: connectionError } = await supabase.from("api_connections").select("id")
+      .eq("id", connectionId).eq("user_id", req.user.id).eq("enabled", true).maybeSingle();
+    if (connectionError) throw connectionError;
+    if (!connection) return res.status(400).json({ success: false, error: "Choose an enabled connection" });
+
+    const { data, error } = await supabase.from("api_feature_routes").upsert({
+      user_id: req.user.id,
+      purpose,
+      connection_id: connectionId,
+      model_id: modelId,
+      follows_purpose: followsPurpose,
+      enabled: req.body.enabled !== false,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "user_id,purpose" }).select().single();
+    if (error) throw error;
+    res.json({ success: true, route: {
+      purpose: data.purpose, connectionId: data.connection_id, modelId: data.model_id,
+      followsPurpose: data.follows_purpose, enabled: data.enabled, updatedAt: data.updated_at,
+    } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
