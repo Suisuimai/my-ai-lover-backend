@@ -257,6 +257,7 @@ async function callModel({ model, messages, temperature, maxTokens, userId, resp
       const text = responseData.choices?.[0]?.message?.content?.trim();
       if (!text) {
         const finishReason = responseData.choices?.[0]?.finish_reason || "unknown";
+        errorCode = "empty_reply";
         throw new Error(`${provider.name} returned an empty reply (finish_reason: ${finishReason})`);
       }
       status = "succeeded";
@@ -295,7 +296,10 @@ async function callModel({ model, messages, temperature, maxTokens, userId, resp
     errorCode = apiErrorCode(responseData, response.status);
     if (!response.ok) throw new Error(responseData.error?.message || "Anthropic request failed");
     const text = responseData.content?.filter((part) => part.type === "text").map((part) => part.text).join("").trim();
-    if (!text) throw new Error("Anthropic returned an empty reply");
+    if (!text) {
+      errorCode = "empty_reply";
+      throw new Error("Anthropic returned an empty reply");
+    }
     status = "succeeded";
     errorCode = null;
     resolvedModel = responseData.model || model;
@@ -598,6 +602,7 @@ async function interpretSemanticEvent({ userId, settings, message, recentMessage
     model: settings.summary_model,
     temperature: 0,
     maxTokens: 450,
+    thinking: "disabled",
     userId,
     messages: [
       { role: "system", content: "You extract structured relationship-continuity events. Follow the schema exactly and never invent a topic." },
@@ -633,6 +638,7 @@ async function extractLongTermMemories({ userId, character, userProfile, session
     model: settings.summary_model,
     temperature: 0.1,
     maxTokens: 350,
+    thinking: "disabled",
     userId,
     messages: [
       { role: "system", content: extractionPrompt },
