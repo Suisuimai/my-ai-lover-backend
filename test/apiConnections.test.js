@@ -1,13 +1,29 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  connectionKind, isPrivateIp, legacyProviderForModel, modelEndpoint, normalizeBaseUrl, safeConnectionView,
+  connectionKind, isPrivateIp, legacyProviderForModel, modelCatalogEndpoint, modelEndpoint,
+  normalizeBaseUrl, normalizeModelCatalog, safeConnectionView,
 } = require("../core/apiConnections");
 
 test("normalizes safe HTTPS base URLs and appends protocol endpoints", () => {
   assert.equal(normalizeBaseUrl("https://openrouter.ai/api/v1/"), "https://openrouter.ai/api/v1");
   assert.equal(modelEndpoint("https://openrouter.ai/api/v1", "openai_compatible"), "https://openrouter.ai/api/v1/chat/completions");
   assert.equal(modelEndpoint("https://api.deepseek.com/anthropic", "anthropic"), "https://api.deepseek.com/anthropic/v1/messages");
+});
+
+test("builds model catalog endpoints without duplicating API path segments", () => {
+  assert.equal(modelCatalogEndpoint("https://openrouter.ai/api/v1", "openai_compatible"), "https://openrouter.ai/api/v1/models");
+  assert.equal(modelCatalogEndpoint("https://example.com/v1/chat/completions", "openai_compatible"), "https://example.com/v1/models");
+  assert.equal(modelCatalogEndpoint("https://api.anthropic.com", "anthropic"), "https://api.anthropic.com/v1/models");
+});
+
+test("normalizes common model catalog response shapes", () => {
+  assert.deepEqual(normalizeModelCatalog({ data: [{ id: "b", name: "Beta" }, { id: "a" }, { id: "a" }] }), [
+    { id: "a", name: "a" }, { id: "b", name: "Beta" },
+  ]);
+  assert.deepEqual(normalizeModelCatalog({ models: ["one", { name: "two" }] }), [
+    { id: "one", name: "one" }, { id: "two", name: "two" },
+  ]);
 });
 
 test("recognizes gateway capabilities from a connection without exposing providers as cards", () => {

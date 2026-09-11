@@ -56,6 +56,32 @@ function modelEndpoint(baseUrl, apiFormat) {
   return normalized.endsWith("/chat/completions") ? normalized : `${normalized}/chat/completions`;
 }
 
+function modelCatalogEndpoint(baseUrl, apiFormat) {
+  if (!API_FORMATS.has(apiFormat)) throw new Error("Unsupported API format");
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (apiFormat === "anthropic") {
+    if (normalized.endsWith("/v1/messages")) return `${normalized.slice(0, -"/messages".length)}/models`;
+    if (normalized.endsWith("/v1")) return `${normalized}/models`;
+    return `${normalized}/v1/models`;
+  }
+  if (normalized.endsWith("/chat/completions")) return `${normalized.slice(0, -"/chat/completions".length)}/models`;
+  return `${normalized}/models`;
+}
+
+function normalizeModelCatalog(payload) {
+  const rows = Array.isArray(payload?.data) ? payload.data
+    : Array.isArray(payload?.models) ? payload.models
+      : [];
+  return rows.map((item) => {
+    const id = typeof item === "string" ? item : item?.id || item?.name;
+    if (!id) return null;
+    const name = item?.name || item?.display_name || id;
+    return { id: String(id), name: String(name) };
+  }).filter(Boolean)
+    .filter((item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index)
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
 function legacyProviderForModel(model) {
   const value = String(model || "");
   if (value.startsWith("deepseek-")) return "deepseek";
@@ -93,7 +119,9 @@ module.exports = {
   connectionKind,
   isPrivateIp,
   legacyProviderForModel,
+  modelCatalogEndpoint,
   modelEndpoint,
+  normalizeModelCatalog,
   normalizeBaseUrl,
   safeConnectionView,
 };
