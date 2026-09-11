@@ -32,7 +32,14 @@ const {
 const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } = require("./core/timeline");
 const { formatWindowContinuity } = require("./core/handoff");
 const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
-const { buildExtractionPrompt, buildVerificationPrompt, parseMemoryExtraction: parsePracticeExtraction, parseMemoryVerification } = require("./core/memoryPractice");
+const {
+  buildExperienceExtractionPrompt,
+  buildSupportExtractionPrompt,
+  buildVerificationPrompt,
+  parseExperienceExtraction,
+  parseMemoryVerification,
+  parseSupportExtraction,
+} = require("./core/memoryPractice");
 const { apiErrorCode, normalizeModelUsage } = require("./core/apiUsage");
 const {
   API_FORMATS,
@@ -261,8 +268,12 @@ async function callModel({ model, messages, temperature, maxTokens, userId, resp
       errorCode = apiErrorCode(responseData, response.status);
       if (!response.ok) throw new Error(responseData.error?.message || `${provider.name} request failed`);
       const text = responseData.choices?.[0]?.message?.content?.trim();
+      const finishReason = responseData.choices?.[0]?.finish_reason || "unknown";
+      if (responseFormat && finishReason === "length") {
+        errorCode = "incomplete_structured_reply";
+        throw new Error(`${provider.name} returned an incomplete structured reply`);
+      }
       if (!text) {
-        const finishReason = responseData.choices?.[0]?.finish_reason || "unknown";
         errorCode = "empty_reply";
         throw new Error(`${provider.name} returned an empty reply (finish_reason: ${finishReason})`);
       }
@@ -1718,31 +1729,44 @@ app.post("/memory-practice/segments/:segmentId/extract", async (req, res) => {
     const numberedTranscript = sourceMessages.map((message, index) =>
       `[M${index + 1}] ${message.role === "user" ? "User" : "Companion"}: ${message.content}`).join("\n\n");
 
-    let extraction;
-    let lastError;
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      try {
-        const raw = await callModel({
+    async function extractPart({ prompt, parser, maxTokens }) {
+      let lastError;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          const raw = await callModel({
           purpose: "long_term_memory_extraction",
           model: settings.summary_model,
           userId: req.user.id,
           temperature: 0.05,
-          maxTokens: 4200,
+          maxTokens,
           responseFormat: "json_object",
           thinking: "disabled",
           messages: [
             { role: "system", content: "You are a conservative documentary memory extractor. Follow the requested JSON schema exactly." },
-            { role: "user", content: buildExtractionPrompt(numberedTranscript, segment.started_at, segment.ended_at) },
-            ...(attempt === 2 ? [{ role: "user", content: `The previous result failed validation: ${lastError.message}. Regenerate the complete JSON and fix that problem.` }] : []),
+            { role: "user", content: prompt },
+            ...(attempt === 2 ? [{ role: "user", content: "The previous output was incomplete or failed strict validation. Return a shorter, complete JSON object and follow the schema exactly." }] : []),
           ],
         });
-        extraction = parsePracticeExtraction(raw, sourceMessages);
-        break;
-      } catch (extractionError) {
-        lastError = extractionError;
+          return parser(raw, sourceMessages);
+        } catch (extractionError) {
+          lastError = extractionError;
+        }
       }
+      const failure = new Error("记忆模型连续两次没有返回完整、合格的结构化结果。请换一个更短的片段后重试。");
+      failure.cause = lastError;
+      throw failure;
     }
-    if (!extraction) throw lastError;
+    const experiencePart = await extractPart({
+      prompt: buildExperienceExtractionPrompt(numberedTranscript, segment.started_at, segment.ended_at),
+      parser: parseExperienceExtraction,
+      maxTokens: 2200,
+    });
+    const supportPart = await extractPart({
+      prompt: buildSupportExtractionPrompt(numberedTranscript, segment.started_at, segment.ended_at),
+      parser: parseSupportExtraction,
+      maxTokens: 2200,
+    });
+    const extraction = { experiences: experiencePart.experiences, knowledgeNotes: supportPart.knowledgeNotes, handoff: supportPart.handoff };
 
     const target = await getModelTarget({ userId: req.user.id, purpose: "long_term_memory_extraction", legacyModel: settings.summary_model });
     const { data: savedBatch, error: batchError } = await supabase.from("memory_processing_batches").upsert({
