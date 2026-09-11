@@ -1,6 +1,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildExtractionPrompt, buildVerificationPrompt, parseMemoryExtraction, parseMemoryVerification } = require("../core/memoryPractice");
+const {
+  buildExperienceExtractionPrompt, buildExtractionPrompt, buildSupportExtractionPrompt,
+  buildVerificationPrompt, parseMemoryExtraction, parseMemoryVerification,
+} = require("../core/memoryPractice");
 
 const source = [
   { role: "user", content: "秋季旅行还不确定，我们一周后再讨论。" },
@@ -33,6 +36,14 @@ test("extraction prompt requires the evidence grid", () => {
   assert.match(prompt, /people_places/);
   assert.match(prompt, /synonyms must contain at least 2/);
   assert.match(prompt, /evidence_message_numbers/);
+});
+
+test("split extraction prompts keep large outputs in separate JSON objects", () => {
+  const experiences = buildExperienceExtractionPrompt("[M1] User: hi", "start", "end");
+  const support = buildSupportExtractionPrompt("[M1] User: hi", "start", "end");
+  assert.match(experiences, /Do not return knowledge_notes or handoff/);
+  assert.match(support, /Do not return experiences/);
+  assert.match(experiences, /0-3 experiences/);
 });
 
 test("verification requires every experience and grounded knowledge patches", () => {

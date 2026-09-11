@@ -69,6 +69,16 @@ function parseMemoryExtraction(raw, sourceMessages) {
   return { experiences, knowledgeNotes, handoff };
 }
 
+function parseExperienceExtraction(raw, sourceMessages) {
+  const extraction = parseMemoryExtraction(raw, sourceMessages);
+  return { experiences: extraction.experiences, knowledgeNotes: [], handoff: null };
+}
+
+function parseSupportExtraction(raw, sourceMessages) {
+  const extraction = parseMemoryExtraction(raw, sourceMessages);
+  return { experiences: [], knowledgeNotes: extraction.knowledgeNotes, handoff: extraction.handoff };
+}
+
 function buildExtractionPrompt(numberedTranscript, startedAt, endedAt) {
   return [
     "Extract grounded memory material from an AI-companion conversation. Return JSON only.",
@@ -82,6 +92,30 @@ function buildExtractionPrompt(numberedTranscript, startedAt, endedAt) {
       knowledge_notes: [{ suggested_document_name: "", note_markdown: "", evidence_message_numbers: [1] }],
       handoff: { body_markdown: "", current_state: "", topics: [""], open_loops: [""], continuation_guidance: "", evidence_message_numbers: [1] },
     }),
+    `Segment time: ${startedAt} to ${endedAt}`,
+    numberedTranscript,
+  ].join("\n\n");
+}
+
+function buildExperienceExtractionPrompt(numberedTranscript, startedAt, endedAt) {
+  return [
+    "Extract only grounded dated experiences from an AI-companion conversation. Return JSON only.",
+    "Return 0-3 experiences. Do not return knowledge_notes or handoff.",
+    "Do not invent causes, feelings, decisions, or outcomes. Every factual claim must cite evidence_message_numbers.",
+    "Each search_anchors object must contain arrays named people_places, event_names, key_objects, special_phrases, synonyms, final_state_terms.",
+    "synonyms must contain at least 2 useful alternative ways the user may later refer to the same event.",
+    `Schema: ${JSON.stringify({ experiences: [{ title: "", narrative_markdown: "", current_state: "", index_summary: "", evidence_message_numbers: [1], search_anchors: Object.fromEntries(ANCHOR_FIELDS.map((field) => [field, [""]])) }] })}`,
+    `Segment time: ${startedAt} to ${endedAt}`,
+    numberedTranscript,
+  ].join("\n\n");
+}
+
+function buildSupportExtractionPrompt(numberedTranscript, startedAt, endedAt) {
+  return [
+    "Extract only Knowledge File notes and window-handoff material from an AI-companion conversation. Return JSON only.",
+    "Do not return experiences. Create 0-4 concise knowledge notes. Do not rewrite a complete knowledge file.",
+    "Every note and handoff must cite evidence_message_numbers. Do not invent feelings, decisions, or outcomes.",
+    `Schema: ${JSON.stringify({ knowledge_notes: [{ suggested_document_name: "", note_markdown: "", evidence_message_numbers: [1] }], handoff: { body_markdown: "", current_state: "", topics: [""], open_loops: [""], continuation_guidance: "", evidence_message_numbers: [1] } })}`,
     `Segment time: ${startedAt} to ${endedAt}`,
     numberedTranscript,
   ].join("\n\n");
@@ -134,4 +168,8 @@ function buildVerificationPrompt({ numberedTranscript, experiences, knowledgeNot
   ].join("\n\n");
 }
 
-module.exports = { ANCHOR_FIELDS, buildExtractionPrompt, buildVerificationPrompt, normalizeAnchors, parseMemoryExtraction, parseMemoryVerification };
+module.exports = {
+  ANCHOR_FIELDS, buildExperienceExtractionPrompt, buildExtractionPrompt, buildSupportExtractionPrompt,
+  buildVerificationPrompt, normalizeAnchors, parseExperienceExtraction, parseMemoryExtraction,
+  parseMemoryVerification, parseSupportExtraction,
+};
