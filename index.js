@@ -35,11 +35,14 @@ const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentC
 const { apiErrorCode, normalizeModelUsage } = require("./core/apiUsage");
 const {
   API_FORMATS,
+  FEATURE_DEFINITIONS,
   FEATURE_PURPOSES,
   connectionKind,
   isPrivateIp,
+  modelCatalogEndpoint,
   modelEndpoint,
   normalizeBaseUrl,
+  normalizeModelCatalog,
   safeConnectionView,
 } = require("./core/apiConnections");
 const {
@@ -62,6 +65,8 @@ if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const app = express();
 const PORT = process.env.PORT || 3000;
+const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
+const modelCatalogCache = new Map();
 
 const DEFAULT_SETTINGS = {
   system_prompt: "You are a warm, thoughtful AI companion. Respond naturally and supportively.",
@@ -1693,6 +1698,10 @@ app.patch("/settings", async (req, res) => {
 });
 
 // User-defined API connections. Secrets remain write-only and server-side.
+app.get("/api-feature-definitions", (req, res) => {
+  res.json({ success: true, features: FEATURE_DEFINITIONS.filter((feature) => !feature.hidden) });
+});
+
 app.get("/api-connections", async (req, res) => {
   try {
     const { data, error } = await supabase.from("api_connections").select("*")
@@ -1701,6 +1710,41 @@ app.get("/api-connections", async (req, res) => {
     res.json({ success: true, connections: (data || []).map(safeConnectionView) });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/api-connections/:connectionId/models", async (req, res) => {
+  try {
+    const { data: connection, error } = await supabase.from("api_connections").select("*")
+      .eq("id", req.params.connectionId).eq("user_id", req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!connection) return res.status(404).json({ success: false, error: "Connection not found" });
+    if (!connection.enabled) return res.status(400).json({ success: false, error: "Enable this connection before loading models" });
+
+    const cached = modelCatalogCache.get(connection.id);
+    if (cached && Date.now() - cached.loadedAt < MODEL_CATALOG_TTL_MS) {
+      return res.json({ success: true, models: cached.models, cached: true, loadedAt: new Date(cached.loadedAt).toISOString() });
+    }
+
+    const endpoint = modelCatalogEndpoint(connection.base_url, connection.api_format);
+    await validatePublicConnectionUrl(endpoint);
+    const headers = connection.api_format === "anthropic"
+      ? { "x-api-key": decryptSecret(connection.encrypted_key), "anthropic-version": "2023-06-01" }
+      : { Authorization: `Bearer ${decryptSecret(connection.encrypted_key)}` };
+    const response = await fetch(endpoint, { method: "GET", redirect: "error", headers, signal: AbortSignal.timeout(15000) });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const upstreamMessage = payload?.error?.message || payload?.error || `HTTP ${response.status}`;
+      throw new Error(`Model list request failed: ${upstreamMessage}`);
+    }
+    const models = normalizeModelCatalog(payload);
+    if (!models.length) throw new Error("This connection returned no usable model list; you can still enter a model ID manually");
+    const loadedAt = Date.now();
+    modelCatalogCache.set(connection.id, { models, loadedAt });
+    res.json({ success: true, models, cached: false, loadedAt: new Date(loadedAt).toISOString() });
+  } catch (error) {
+    const message = error.name === "TimeoutError" ? "Loading models timed out; check the connection or enter a model ID manually" : error.message;
+    res.status(502).json({ success: false, error: message });
   }
 });
 
