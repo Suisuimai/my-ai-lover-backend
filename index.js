@@ -32,6 +32,7 @@ const {
 const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } = require("./core/timeline");
 const { formatWindowContinuity } = require("./core/handoff");
 const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
+const { buildExtractionPrompt, buildVerificationPrompt, parseMemoryExtraction: parsePracticeExtraction, parseMemoryVerification } = require("./core/memoryPractice");
 const { apiErrorCode, normalizeModelUsage } = require("./core/apiUsage");
 const {
   API_FORMATS,
@@ -1700,6 +1701,168 @@ app.patch("/settings", async (req, res) => {
 // User-defined API connections. Secrets remain write-only and server-side.
 app.get("/api-feature-definitions", (req, res) => {
   res.json({ success: true, features: FEATURE_DEFINITIONS.filter((feature) => !feature.hidden) });
+});
+
+app.post("/memory-practice/segments/:segmentId/extract", async (req, res) => {
+  let batch;
+  try {
+    const { data: segment, error } = await supabase.from("imported_conversation_segments").select("*")
+      .eq("id", req.params.segmentId).eq("user_id", req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!segment) return res.status(404).json({ success: false, error: "Imported segment not found" });
+    const settings = await getSettings(req.user.id);
+    const sourceMessages = (segment.raw_messages || []).map((message) => ({
+      role: message.role,
+      content: cleanClaudeSay(message.role, message.content),
+    }));
+    const numberedTranscript = sourceMessages.map((message, index) =>
+      `[M${index + 1}] ${message.role === "user" ? "User" : "Companion"}: ${message.content}`).join("\n\n");
+
+    let extraction;
+    let lastError;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        const raw = await callModel({
+          purpose: "long_term_memory_extraction",
+          model: settings.summary_model,
+          userId: req.user.id,
+          temperature: 0.05,
+          maxTokens: 4200,
+          responseFormat: "json_object",
+          thinking: "disabled",
+          messages: [
+            { role: "system", content: "You are a conservative documentary memory extractor. Follow the requested JSON schema exactly." },
+            { role: "user", content: buildExtractionPrompt(numberedTranscript, segment.started_at, segment.ended_at) },
+            ...(attempt === 2 ? [{ role: "user", content: `The previous result failed validation: ${lastError.message}. Regenerate the complete JSON and fix that problem.` }] : []),
+          ],
+        });
+        extraction = parsePracticeExtraction(raw, sourceMessages);
+        break;
+      } catch (extractionError) {
+        lastError = extractionError;
+      }
+    }
+    if (!extraction) throw lastError;
+
+    const target = await getModelTarget({ userId: req.user.id, purpose: "long_term_memory_extraction", legacyModel: settings.summary_model });
+    const { data: savedBatch, error: batchError } = await supabase.from("memory_processing_batches").upsert({
+      user_id: req.user.id,
+      character_id: segment.character_id,
+      import_id: segment.import_id,
+      segment_id: segment.id,
+      status: "extracted",
+      extraction_model: target.model,
+      verification_model: null,
+      verified_at: null,
+    }, { onConflict: "segment_id" }).select().single();
+    if (batchError) throw batchError;
+    batch = savedBatch;
+
+    await Promise.all([
+      supabase.from("memory_experience_candidates").delete().eq("batch_id", batch.id).eq("user_id", req.user.id),
+      supabase.from("memory_knowledge_notes").delete().eq("batch_id", batch.id).eq("user_id", req.user.id),
+      supabase.from("memory_handoff_candidates").delete().eq("batch_id", batch.id).eq("user_id", req.user.id),
+    ]);
+    const experienceRows = extraction.experiences.map((item) => ({
+      batch_id: batch.id, user_id: req.user.id, character_id: segment.character_id,
+      title: item.title, narrative_markdown: item.narrativeMarkdown, current_state: item.currentState,
+      index_summary: item.indexSummary, search_anchors: item.anchors, evidence_refs: item.evidence,
+    }));
+    const noteRows = extraction.knowledgeNotes.map((item) => ({
+      batch_id: batch.id, user_id: req.user.id, character_id: segment.character_id,
+      suggested_document_name: item.suggestedDocumentName, note_markdown: item.noteMarkdown, evidence_refs: item.evidence,
+    }));
+    const handoffRows = extraction.handoff ? [{
+      batch_id: batch.id, user_id: req.user.id, character_id: segment.character_id,
+      body_markdown: extraction.handoff.bodyMarkdown, current_state: extraction.handoff.currentState,
+      topics: extraction.handoff.topics, open_loops: extraction.handoff.openLoops,
+      continuation_guidance: extraction.handoff.continuationGuidance, evidence_refs: extraction.handoff.evidence,
+    }] : [];
+    const [{ data: experiences, error: experienceError }, { data: notes, error: noteError }, { data: handoffs, error: handoffError }] = await Promise.all([
+      experienceRows.length ? supabase.from("memory_experience_candidates").insert(experienceRows).select("*") : { data: [], error: null },
+      noteRows.length ? supabase.from("memory_knowledge_notes").insert(noteRows).select("*") : { data: [], error: null },
+      handoffRows.length ? supabase.from("memory_handoff_candidates").insert(handoffRows).select("*") : { data: [], error: null },
+    ]);
+    if (experienceError || noteError || handoffError) throw experienceError || noteError || handoffError;
+    res.json({ success: true, batch, experiences: experiences || [], knowledgeNotes: notes || [], handoffs: handoffs || [] });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/memory-practice/batches", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("memory_processing_batches")
+      .select("*, imported_conversation_segments(sequence,started_at,ended_at), memory_experience_candidates(*), memory_knowledge_notes(*), memory_handoff_candidates(*), memory_knowledge_patch_candidates(*)")
+      .eq("user_id", req.user.id).order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json({ success: true, batches: data || [] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/memory-practice/batches/:batchId/verify", async (req, res) => {
+  try {
+    const { data: batch, error } = await supabase.from("memory_processing_batches").select("*")
+      .eq("id", req.params.batchId).eq("user_id", req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!batch) return res.status(404).json({ success: false, error: "Memory batch not found" });
+    const [{ data: segment, error: segmentError }, { data: experiences, error: experienceError }, { data: notes, error: noteError }] = await Promise.all([
+      supabase.from("imported_conversation_segments").select("*").eq("id", batch.segment_id).eq("user_id", req.user.id).maybeSingle(),
+      supabase.from("memory_experience_candidates").select("*").eq("batch_id", batch.id).eq("user_id", req.user.id),
+      supabase.from("memory_knowledge_notes").select("*").eq("batch_id", batch.id).eq("user_id", req.user.id),
+    ]);
+    if (segmentError || experienceError || noteError) throw segmentError || experienceError || noteError;
+    if (!segment) throw new Error("The source segment for this batch no longer exists");
+    const documents = await loadPromptDocuments(req.user.id, batch.character_id);
+    const suggestedNames = (notes || []).map((item) => item.suggested_document_name.trim().toLocaleLowerCase());
+    const relevantDocuments = documents.filter((document) => suggestedNames.some((name) => {
+      const documentName = document.name.trim().toLocaleLowerCase();
+      return name.includes(documentName) || documentName.includes(name);
+    })).slice(0, 5);
+    const sourceMessages = (segment.raw_messages || []).map((message) => ({ role: message.role, content: cleanClaudeSay(message.role, message.content) }));
+    const numberedTranscript = sourceMessages.map((message, index) =>
+      `[M${index + 1}] ${message.role === "user" ? "User" : "Companion"}: ${message.content}`).join("\n\n");
+    const settings = await getSettings(req.user.id);
+    const raw = await callModel({
+      purpose: "memory_verification",
+      model: settings.summary_model,
+      userId: req.user.id,
+      temperature: 0,
+      maxTokens: 7000,
+      responseFormat: "json_object",
+      thinking: "disabled",
+      messages: [
+        { role: "system", content: "You are a strict documentary fact checker and knowledge-file editor. Return JSON only." },
+        { role: "user", content: buildVerificationPrompt({ numberedTranscript, experiences: experiences || [], knowledgeNotes: notes || [], documents: relevantDocuments }) },
+      ],
+    });
+    const verification = parseMemoryVerification(raw, sourceMessages, (experiences || []).map((item) => item.id), relevantDocuments);
+    await supabase.from("memory_knowledge_patch_candidates").delete().eq("batch_id", batch.id).eq("user_id", req.user.id).eq("review_status", "suggested");
+    for (const review of verification.experienceReviews) {
+      const { error: updateError } = await supabase.from("memory_experience_candidates").update({ verification_status: review.verdict, verification_notes: review.correctionReason })
+        .eq("id", review.candidateId).eq("batch_id", batch.id).eq("user_id", req.user.id);
+      if (updateError) throw updateError;
+    }
+    const patchRows = verification.knowledgePatches.map((item) => ({
+      batch_id: batch.id, user_id: req.user.id, character_id: batch.character_id,
+      document_id: item.documentId, document_name: item.documentName, previous_content: item.previousContent,
+      proposed_content: item.proposedContent, change_summary: item.changeSummary, evidence_refs: item.evidence,
+    }));
+    const { data: patches, error: patchError } = patchRows.length
+      ? await supabase.from("memory_knowledge_patch_candidates").insert(patchRows).select("*")
+      : { data: [], error: null };
+    if (patchError) throw patchError;
+    const target = await getModelTarget({ userId: req.user.id, purpose: "memory_verification", legacyModel: settings.summary_model });
+    const { data: savedBatch, error: batchError } = await supabase.from("memory_processing_batches").update({
+      status: "verified", verification_model: target.model, verified_at: new Date().toISOString(),
+    }).eq("id", batch.id).eq("user_id", req.user.id).select().single();
+    if (batchError) throw batchError;
+    res.json({ success: true, batch: savedBatch, patches: patches || [], experienceReviews: verification.experienceReviews });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
 });
 
 app.get("/api-connections", async (req, res) => {
