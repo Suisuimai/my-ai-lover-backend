@@ -1,15 +1,19 @@
 const net = require("node:net");
 
 const API_FORMATS = new Set(["openai_compatible", "anthropic"]);
-const FEATURE_PURPOSES = new Set([
-  "companion_chat",
-  "conversation_summary",
-  "conversation_title",
-  "followup_interpretation",
-  "long_term_memory_extraction",
-  "timeline_generation",
-  "embedding",
-]);
+// Register model-backed jobs here. The frontend reads this catalog from the backend,
+// while each purpose still has to be wired to a real callModel() call before use.
+const FEATURE_DEFINITIONS = [
+  { id: "companion_chat", name: "伴侣聊天", description: "生成每次正式回复" },
+  { id: "long_term_memory_extraction", name: "记忆提取", description: "批量读取对话，提取事件、证据与候选文档", recommendation: "建议使用便宜模型" },
+  { id: "memory_verification", name: "记忆校验与合并", description: "检查失真并合并 Knowledge File", recommendation: "建议使用较强模型" },
+  { id: "timeline_generation", name: "候选日记", description: "整理导入的 Claude 对话" },
+  { id: "conversation_title", name: "窗口标题", description: "默认跟随伴侣聊天", follows: "companion_chat" },
+  { id: "conversation_summary", name: "窗口摘要", description: "默认跟随记忆提取", follows: "long_term_memory_extraction" },
+  { id: "followup_interpretation", name: "Followup 判断", description: "默认跟随记忆提取", follows: "long_term_memory_extraction" },
+  { id: "embedding", name: "语义检索", description: "为未来的语义召回生成向量", hidden: true },
+];
+const FEATURE_PURPOSES = new Set(FEATURE_DEFINITIONS.map((feature) => feature.id));
 
 function isPrivateIp(address) {
   const plain = String(address || "").replace(/^\[|\]$/g, "").toLowerCase();
@@ -115,6 +119,7 @@ function safeConnectionView(connection) {
 
 module.exports = {
   API_FORMATS,
+  FEATURE_DEFINITIONS,
   FEATURE_PURPOSES,
   connectionKind,
   isPrivateIp,

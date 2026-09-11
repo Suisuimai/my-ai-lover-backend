@@ -35,6 +35,7 @@ const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentC
 const { apiErrorCode, normalizeModelUsage } = require("./core/apiUsage");
 const {
   API_FORMATS,
+  FEATURE_DEFINITIONS,
   FEATURE_PURPOSES,
   connectionKind,
   isPrivateIp,
@@ -1697,6 +1698,10 @@ app.patch("/settings", async (req, res) => {
 });
 
 // User-defined API connections. Secrets remain write-only and server-side.
+app.get("/api-feature-definitions", (req, res) => {
+  res.json({ success: true, features: FEATURE_DEFINITIONS.filter((feature) => !feature.hidden) });
+});
+
 app.get("/api-connections", async (req, res) => {
   try {
     const { data, error } = await supabase.from("api_connections").select("*")

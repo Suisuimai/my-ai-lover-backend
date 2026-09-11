@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  connectionKind, isPrivateIp, legacyProviderForModel, modelCatalogEndpoint, modelEndpoint,
+  FEATURE_DEFINITIONS, FEATURE_PURPOSES, connectionKind, isPrivateIp, legacyProviderForModel, modelCatalogEndpoint, modelEndpoint,
   normalizeBaseUrl, normalizeModelCatalog, safeConnectionView,
 } = require("../core/apiConnections");
 
@@ -24,6 +24,12 @@ test("normalizes common model catalog response shapes", () => {
   assert.deepEqual(normalizeModelCatalog({ models: ["one", { name: "two" }] }), [
     { id: "one", name: "one" }, { id: "two", name: "two" },
   ]);
+});
+
+test("keeps feature registration centralized and includes separate memory jobs", () => {
+  assert.deepEqual(new Set(FEATURE_DEFINITIONS.map((feature) => feature.id)), FEATURE_PURPOSES);
+  assert.equal(FEATURE_PURPOSES.has("long_term_memory_extraction"), true);
+  assert.equal(FEATURE_PURPOSES.has("memory_verification"), true);
 });
 
 test("recognizes gateway capabilities from a connection without exposing providers as cards", () => {
