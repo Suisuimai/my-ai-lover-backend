@@ -14,6 +14,10 @@ function parseJsonObject(raw) {
   return JSON.parse(match[0]);
 }
 
+function stripTransientCitations(value) {
+  return String(value || "").replace(/\[(?:M\d+|S\d+-M\d+)\]/gi, "").replace(/[ \t]+\n/g, "\n").replace(/ {2,}/g, " ").trim();
+}
+
 function evidenceFromNumbers(numbers, sourceMessages, limit = 8) {
   const normalized = [...new Set((Array.isArray(numbers) ? numbers : []).filter(Number.isInteger))].slice(0, limit);
   if (!normalized.length || normalized.some((number) => number < 1 || number > sourceMessages.length)) {
@@ -46,7 +50,7 @@ function parseMemoryExtraction(raw, sourceMessages) {
     }
     return {
       title: String(item.title).trim().slice(0, 160),
-      narrativeMarkdown: String(item.narrative_markdown).trim().slice(0, 20000),
+      narrativeMarkdown: stripTransientCitations(item.narrative_markdown).slice(0, 20000),
       currentState: String(item.current_state).trim().slice(0, 3000),
       indexSummary: String(item.index_summary).trim().slice(0, 1200),
       anchors: normalizeAnchors(item.search_anchors),
@@ -55,7 +59,8 @@ function parseMemoryExtraction(raw, sourceMessages) {
   });
   const knowledgeNotes = (Array.isArray(parsed.knowledge_notes) ? parsed.knowledge_notes : []).slice(0, 6).map((item) => ({
     suggestedDocumentName: String(item.suggested_document_name || "").trim().slice(0, 120),
-    noteMarkdown: String(item.note_markdown || "").trim().slice(0, 6000),
+    noteMarkdown: stripTransientCitations(item.note_markdown).slice(0, 6000),
+    suggestedDocumentId: typeof item.target_document_id === "string" ? item.target_document_id : null,
     evidence: evidenceFromNumbers(item.evidence_message_numbers, sourceMessages),
   })).filter((item) => item.suggestedDocumentName && item.noteMarkdown);
   const handoff = parsed.handoff && parsed.handoff.body_markdown ? {
@@ -110,12 +115,14 @@ function buildExperienceExtractionPrompt(numberedTranscript, startedAt, endedAt)
   ].join("\n\n");
 }
 
-function buildSupportExtractionPrompt(numberedTranscript, startedAt, endedAt) {
+function buildSupportExtractionPrompt(numberedTranscript, startedAt, endedAt, documents = []) {
   return [
     "Extract only Knowledge File notes and window-handoff material from an AI-companion conversation. Return JSON only.",
     "Do not return experiences. Create 0-4 concise knowledge notes. Do not rewrite a complete knowledge file.",
+    "Route each note to one existing target_document_id from the catalog when it clearly fits. Otherwise use null; never invent an ID.",
     "Every note and handoff must cite evidence_message_numbers. Do not invent feelings, decisions, or outcomes.",
-    `Schema: ${JSON.stringify({ knowledge_notes: [{ suggested_document_name: "", note_markdown: "", evidence_message_numbers: [1] }], handoff: { body_markdown: "", current_state: "", topics: [""], open_loops: [""], continuation_guidance: "", evidence_message_numbers: [1] } })}`,
+    `Existing Knowledge File catalog: ${JSON.stringify(documents.map(({ id, name, document_type }) => ({ id, name, document_type })))}`,
+    `Schema: ${JSON.stringify({ knowledge_notes: [{ target_document_id: null, suggested_document_name: "", note_markdown: "", evidence_message_numbers: [1] }], handoff: { body_markdown: "", current_state: "", topics: [""], open_loops: [""], continuation_guidance: "", evidence_message_numbers: [1] } })}`,
     `Segment time: ${startedAt} to ${endedAt}`,
     numberedTranscript,
   ].join("\n\n");
@@ -129,10 +136,16 @@ function parseMemoryVerification(raw, sourceMessages, allowedExperienceIds, docu
     if (!allowedIds.has(item.candidate_id) || !["verified", "needs_revision"].includes(item.verdict)) {
       throw new Error("Verification returned an unknown experience or verdict");
     }
+    let verdict = item.verdict;
+    let correctionReason = String(item.correction_reason || "").trim().slice(0, 2000);
+    if (correctionReason.length < 4) {
+      verdict = "needs_revision";
+      correctionReason = "校验模型没有提供有效理由，需要重新校验。";
+    }
     return {
       candidateId: item.candidate_id,
-      verdict: item.verdict,
-      correctionReason: String(item.correction_reason || "").trim().slice(0, 2000),
+      verdict,
+      correctionReason,
     };
   });
   if (experienceReviews.length !== allowedIds.size || new Set(experienceReviews.map((item) => item.candidateId)).size !== allowedIds.size) {
@@ -143,7 +156,7 @@ function parseMemoryVerification(raw, sourceMessages, allowedExperienceIds, docu
     if (documentId && !documentMap.has(documentId)) throw new Error("Verification referenced an unknown knowledge file");
     const existing = documentId ? documentMap.get(documentId) : null;
     const name = String(existing?.name || item.document_name || "").trim().slice(0, 120);
-    const proposedContent = String(item.proposed_content || "").trim().slice(0, 30000);
+    const proposedContent = stripTransientCitations(item.proposed_content).slice(0, 30000);
     const changeSummary = String(item.change_summary || "").trim().slice(0, 2000);
     if (!name || !proposedContent || !changeSummary) throw new Error("A knowledge-file patch is incomplete");
     return {
@@ -152,6 +165,40 @@ function parseMemoryVerification(raw, sourceMessages, allowedExperienceIds, docu
     };
   });
   return { experienceReviews, knowledgePatches };
+}
+
+function buildDocumentMergePrompt({ document, notes, mentionCount, segmentCount }) {
+  const material = notes.map((note, index) => ({
+    material_id: `N${index + 1}`,
+    note: note.note_markdown,
+    evidence: (note.evidence_refs || []).map((item) => ({ role: item.role, quote: String(item.quote || "").slice(0, 800) })),
+  }));
+  return [
+    "Update exactly one existing Knowledge File using grounded weekly material. Return JSON only.",
+    "Preserve supported existing content and its Markdown structure. Do not create another file.",
+    "Ordinary preferences or interaction patterns normally require evidence from at least 2 separate segments.",
+    "A single explicit agreement, secret, boundary, major event, or direct correction may be added once if clearly supported.",
+    "Exclude temporary roleplay scenery, filler, duplicated wording, speculation, and unsupported inference.",
+    "Do not put temporary evidence labels such as [M12], [S2-M4], or [N1] in proposed_content.",
+    "Schema: {\"change_summary\":\"\",\"why\":\"\",\"proposed_content\":\"\",\"used_material_ids\":[\"N1\"]}",
+    `Program-counted evidence: ${mentionCount} routed notes across ${segmentCount} separate conversation segments.`,
+    `Existing document name: ${document.name}`,
+    `Existing document Markdown:\n${document.content}`,
+    `Weekly routed material:\n${JSON.stringify(material)}`,
+  ].join("\n\n");
+}
+
+function parseDocumentMerge(raw, allowedMaterialIds) {
+  const parsed = parseJsonObject(raw);
+  const proposedContent = stripTransientCitations(parsed.proposed_content).slice(0, 30000);
+  const changeSummary = String(parsed.change_summary || "").trim().slice(0, 2000);
+  const why = String(parsed.why || "").trim().slice(0, 2000);
+  const allowed = new Set(allowedMaterialIds);
+  const usedMaterialIds = uniqueStrings(parsed.used_material_ids, allowed.size, 30);
+  if (!proposedContent || !changeSummary || why.length < 4) throw new Error("The document merge is missing content, summary, or reasoning");
+  if (!usedMaterialIds.length) throw new Error("The document merge did not use any grounded weekly material");
+  if (usedMaterialIds.some((id) => !allowed.has(id))) throw new Error("The document merge cited unknown weekly material");
+  return { proposedContent, changeSummary, why, usedMaterialIds };
 }
 
 function buildVerificationPrompt({ numberedTranscript, experiences, knowledgeNotes, documents }) {
@@ -170,6 +217,7 @@ function buildVerificationPrompt({ numberedTranscript, experiences, knowledgeNot
 
 module.exports = {
   ANCHOR_FIELDS, buildExperienceExtractionPrompt, buildExtractionPrompt, buildSupportExtractionPrompt,
-  buildVerificationPrompt, normalizeAnchors, parseExperienceExtraction, parseMemoryExtraction,
-  parseMemoryVerification, parseSupportExtraction,
+  buildDocumentMergePrompt, buildVerificationPrompt, normalizeAnchors, parseDocumentMerge,
+  parseExperienceExtraction, parseMemoryExtraction, parseMemoryVerification, parseSupportExtraction,
+  stripTransientCitations,
 };
