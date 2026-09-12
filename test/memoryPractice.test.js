@@ -2,7 +2,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   buildExperienceExtractionPrompt, buildExtractionPrompt, buildSupportExtractionPrompt,
-  buildVerificationPrompt, parseMemoryExtraction, parseMemoryVerification,
+  buildDocumentMergePrompt, buildVerificationPrompt, parseDocumentMerge, parseMemoryExtraction,
+  parseMemoryVerification, stripTransientCitations,
 } = require("../core/memoryPractice");
 
 const source = [
@@ -61,4 +62,18 @@ test("verification prompt contains source, candidates, and existing files", () =
   assert.match(prompt, /EXTRACTED EXPERIENCES/);
   assert.match(prompt, /EXISTING KNOWLEDGE FILES/);
   assert.match(prompt, /SOURCE MESSAGES/);
+});
+
+test("removes temporary message citations from durable Markdown", () => {
+  assert.equal(stripTransientCitations("事实。[M12][S2-M4]\n下一行"), "事实。\n下一行");
+});
+
+test("builds and parses one-document weekly merges", () => {
+  const prompt = buildDocumentMergePrompt({ document: { name: "亲密手册", content: "# 旧内容" }, notes: [], mentionCount: 3, segmentCount: 2 });
+  assert.match(prompt, /exactly one existing Knowledge File/);
+  assert.match(prompt, /3 routed notes across 2/);
+  const parsed = parseDocumentMerge(JSON.stringify({ change_summary: "补充约定", why: "两段对话重复确认", proposed_content: "# 新内容\n约定。[M2]", used_material_ids: ["N1"] }), ["N1"]);
+  assert.equal(parsed.proposedContent, "# 新内容\n约定。");
+  assert.throws(() => parseDocumentMerge(JSON.stringify({ change_summary: "x", why: "充分理由", proposed_content: "x", used_material_ids: ["N2"] }), ["N1"]), /unknown/);
+  assert.throws(() => parseDocumentMerge(JSON.stringify({ change_summary: "x", why: "充分理由", proposed_content: "x", used_material_ids: [] }), ["N1"]), /did not use/);
 });
