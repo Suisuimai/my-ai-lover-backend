@@ -77,7 +77,11 @@ function buildModelContextLayers({
 }
 
 function buildModelContext(input) {
-  return buildModelContextLayers(input).map(({ role, content }) => ({ role, content }));
+  return buildModelContextLayers(input).map(({ id, role, content }) => ({
+    role,
+    content,
+    ...(id === "always_documents" ? { cacheBoundary: true } : {}),
+  }));
 }
 
 function estimateTokens(text) {
