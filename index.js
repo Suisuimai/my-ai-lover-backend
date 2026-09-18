@@ -7,6 +7,7 @@ const {
   buildModelContext,
   buildModelContextLayers,
   estimateTokens,
+  formatCurrentTime,
   formatCharacterProfile,
   formatUserProfile,
   normalizeRecentMessageLimit,
@@ -31,7 +32,7 @@ const {
   selectRelevantPromptDocuments,
 } = require("./core/promptDocuments");
 const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } = require("./core/timeline");
-const { formatWindowContinuity } = require("./core/handoff");
+const { buildHandoffPrompt, formatWindowContinuity, parseHandoffCandidate } = require("./core/handoff");
 const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
 const {
   buildExperienceExtractionPrompt,
@@ -520,11 +521,10 @@ async function loadRelevantTimeline(userId, characterId, currentMessage) {
   return selected;
 }
 
-async function loadLatestWindowContinuity(userId, characterId) {
+async function loadWindowContinuity(userId, session) {
+  if (!session?.handoff_id) return { handoff: null, tailMessages: [] };
   const { data: handoff, error } = await supabase.from("session_handoffs").select("*")
-    .eq("user_id", userId).eq("character_id", characterId)
-    .in("status", ["auto", "confirmed"])
-    .order("created_at", { ascending: false }).limit(1).maybeSingle();
+    .eq("id", session.handoff_id).eq("user_id", userId).eq("status", "confirmed").maybeSingle();
   if (error) throw error;
   if (!handoff) return { handoff: null, tailMessages: [] };
   const ids = handoff.tail_message_ids || [];
@@ -540,10 +540,14 @@ async function createSession(userId, name = DEFAULT_SESSION_NAME, characterId) {
   const character = characterId
     ? await getOwnedCharacter(characterId, userId)
     : await getOrCreateDefaultCharacter(userId);
+  const { data: latestHandoff, error: handoffError } = await supabase.from("session_handoffs").select("id")
+    .eq("user_id", userId).eq("character_id", character.id).eq("status", "confirmed")
+    .order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (handoffError) throw handoffError;
   const { data, error } = await supabase
     .from("sessions")
-    .insert({ name, user_id: userId, character_id: character.id })
-    .select("id, name, character_id, created_at, updated_at")
+    .insert({ name, user_id: userId, character_id: character.id, handoff_id: latestHandoff?.id || null })
+    .select("id, name, character_id, handoff_id, created_at, updated_at")
     .single();
 
   if (error) throw error;
@@ -561,7 +565,7 @@ async function touchSession(sessionId, userId) {
 }
 
 async function requireOwnedSession(sessionId, userId) {
-  const { data, error } = await supabase.from("sessions").select("id, character_id").eq("id", sessionId).eq("user_id", userId).maybeSingle();
+  const { data, error } = await supabase.from("sessions").select("id, character_id, handoff_id").eq("id", sessionId).eq("user_id", userId).maybeSingle();
   if (error) throw error;
   if (!data) { const missing = new Error("Session not found"); missing.status = 404; throw missing; }
   return data;
@@ -1268,6 +1272,49 @@ app.get("/handoffs", async (req, res) => {
   }
 });
 
+app.post("/handoffs/generate", async (req, res) => {
+  try {
+    const sourceSessionId = typeof req.body.sourceSessionId === "string" ? req.body.sourceSessionId : "";
+    if (!sourceSessionId) return res.status(400).json({ success: false, error: "A source session is required" });
+    await requireOwnedSession(sourceSessionId, req.user.id);
+    const settings = await getSettings(req.user.id);
+    const [{ data: messages, error: messagesError }, { data: memory, error: memoryError }] = await Promise.all([
+      supabase.from("messages").select("id,role,content,created_at")
+        .eq("session_id", sourceSessionId).eq("is_visible", true)
+        .order("created_at", { ascending: false }).limit(40),
+      supabase.from("session_memories").select("summary").eq("session_id", sourceSessionId).maybeSingle(),
+    ]);
+    if (messagesError) throw messagesError;
+    if (memoryError) throw memoryError;
+    const chronological = [...(messages || [])].reverse();
+    if (!chronological.length) return res.status(400).json({ success: false, error: "This conversation has no messages to hand off" });
+    const raw = await callModel({
+      purpose: "conversation_summary",
+      model: settings.summary_model,
+      temperature: 0.1,
+      maxTokens: 1200,
+      thinking: "disabled",
+      responseFormat: "json_object",
+      userId: req.user.id,
+      messages: [
+        { role: "system", content: "You create careful, factual conversation handoffs. Return the requested JSON object only." },
+        { role: "user", content: buildHandoffPrompt({ summary: memory?.summary, messages: chronological }) },
+      ],
+    });
+    const candidate = parseHandoffCandidate(raw);
+    res.json({
+      success: true,
+      candidate: {
+        ...candidate,
+        sourceSessionId,
+        tailMessageIds: chronological.slice(-8).map((item) => item.id),
+      },
+    });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
 app.post("/handoffs", async (req, res) => {
   try {
     const sourceSessionId = typeof req.body.sourceSessionId === "string" ? req.body.sourceSessionId : "";
@@ -1697,6 +1744,7 @@ app.post("/prompt-preview", async (req, res) => {
     if (memoryResult.error) throw memoryResult.error;
     if (summaryResult.error) throw summaryResult.error;
     if (historyResult.error) throw historyResult.error;
+    const continuity = await loadWindowContinuity(req.user.id, session);
 
     let recentMessages = [...(historyResult.data || [])].reverse();
     if (message) {
@@ -1720,9 +1768,11 @@ app.post("/prompt-preview", async (req, res) => {
         ? `User-configured system instructions:\n${settings.system_prompt}`
         : "",
       promptDocuments: formatPromptDocuments(promptDocuments),
+      currentContext: formatCurrentTime(),
       topicDocuments: formatRetrievedPromptDocuments(onDemandDocuments),
       characterProfile: formatCharacterProfile(character),
       userProfile: formatUserProfile(userProfile),
+      windowContinuity: formatWindowContinuity(continuity.handoff, continuity.tailMessages),
       followUps: formatFollowUps(relevantFollowUps),
       longTermMemories: formatLongTermMemories(relevantMemories),
       memorySummary: summaryResult.data?.summary,
@@ -2449,6 +2499,7 @@ app.post("/chat", async (req, res) => {
     const userProfile = await getOrCreateUserProfile(req.user.id);
     const promptDocuments = await loadPromptDocuments(req.user.id, character.id);
     const onDemandDocuments = selectRelevantPromptDocuments(promptDocuments, message, 3);
+    const continuity = await loadWindowContinuity(req.user.id, req.sessionRecord);
     let relevantMemories = [];
     try {
       relevantMemories = await recallMemories(req.user.id, character.id, message);
@@ -2510,9 +2561,11 @@ app.post("/chat", async (req, res) => {
         ? `User-configured system instructions:\n${settings.system_prompt}`
         : "",
       promptDocuments: formatPromptDocuments(promptDocuments),
+      currentContext: formatCurrentTime(),
       topicDocuments: formatRetrievedPromptDocuments(onDemandDocuments),
       characterProfile: formatCharacterProfile(character),
       userProfile: formatUserProfile(userProfile),
+      windowContinuity: formatWindowContinuity(continuity.handoff, continuity.tailMessages),
       followUps: formatFollowUps(relevantFollowUps),
       longTermMemories: formatLongTermMemories(relevantMemories),
       memorySummary,

@@ -18,6 +18,5 @@ blindly: the security migration intentionally deletes legacy demo sessions.
 The first V2 migration will bind existing sessions to a default character
 without deleting messages or `session_memories`.
 
-Current latest migration: `010_api_connections_and_routes.sql`, which safely copies
-legacy encrypted credentials into user-defined connections and adds per-feature
-connection/model assignments while preserving the legacy configuration fallback.
+Current latest migration: `014_session_handoff_binding.sql`, which lets a new
+conversation keep using the exact confirmed handoff selected when it was created.
