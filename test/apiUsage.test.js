@@ -52,6 +52,14 @@ test("normalizes Anthropic cache usage", () => {
   assert.equal(result.cacheWriteTokens, 8);
 });
 
+test("normalizes gateway cache counters when returned at the usage root", () => {
+  const result = normalizeModelUsage("openrouter", {
+    usage: { prompt_tokens: 13000, cached_tokens: 12900, cache_write_tokens: 100 },
+  });
+  assert.equal(result.cacheReadTokens, 12900);
+  assert.equal(result.cacheWriteTokens, 100);
+});
+
 test("extracts a safe API error code without retaining the message", () => {
   assert.equal(apiErrorCode({ error: { code: "insufficient_credits", message: "secret text" } }, 402), "insufficient_credits");
   assert.equal(apiErrorCode({}, 503), "http_503");

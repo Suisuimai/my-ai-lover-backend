@@ -12,6 +12,7 @@ const {
   formatUserProfile,
   normalizeRecentMessageLimit,
 } = require("./core/context");
+const { prepareMessagesForProvider } = require("./core/promptCaching");
 const {
   MEMORY_CATEGORIES,
   formatLongTermMemories,
@@ -234,7 +235,7 @@ async function recordModelUsage(event) {
   }
 }
 
-async function callModel({ model, messages, temperature, maxTokens, userId, responseFormat, thinking, purpose = "unspecified" }) {
+async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified" }) {
   const startedAt = new Date();
   const startedClock = Date.now();
   let provider;
@@ -249,6 +250,10 @@ async function callModel({ model, messages, temperature, maxTokens, userId, resp
     provider = await getModelTarget({ userId, purpose, legacyModel: model });
     model = provider.model;
     if (!provider.apiKey) throw new Error(`${provider.name} API key is not configured. Add it in Settings.`);
+    const providerMessages = prepareMessagesForProvider(messages, {
+      providerName: provider.name,
+      model,
+    });
 
     if (provider.type === "openai-compatible") {
       response = await fetch(provider.endpoint, {
@@ -262,7 +267,8 @@ async function callModel({ model, messages, temperature, maxTokens, userId, resp
           model,
           temperature,
           max_tokens: maxTokens,
-          messages,
+          messages: providerMessages,
+          ...(provider.name === "openrouter" && sessionId ? { session_id: sessionId } : {}),
           ...(responseFormat ? { response_format: { type: responseFormat } } : {}),
           ...(provider.name === "deepseek" && thinking ? { thinking: { type: thinking } } : {}),
         }),
@@ -288,11 +294,11 @@ async function callModel({ model, messages, temperature, maxTokens, userId, resp
       return text;
     }
 
-    const system = messages
+    const system = providerMessages
       .filter((message) => message.role === "system")
       .map((message) => message.content)
       .join("\n\n");
-    const conversation = messages
+    const conversation = providerMessages
       .filter((message) => message.role !== "system")
       .map(({ role, content }) => ({ role, content }));
 
@@ -2230,6 +2236,42 @@ app.get("/api-connections", async (req, res) => {
   }
 });
 
+app.get("/api-usage-events", async (req, res) => {
+  try {
+    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? requestedLimit : 30));
+    const { data, error } = await supabase.from("api_usage_events")
+      .select("id,purpose,provider,requested_model,resolved_model,status,input_tokens,output_tokens,total_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,provider_cost,cost_currency,cost_source,duration_ms,started_at")
+      .eq("user_id", req.user.id)
+      .order("started_at", { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    res.json({
+      success: true,
+      events: (data || []).map((event) => ({
+        id: event.id,
+        purpose: event.purpose,
+        provider: event.provider,
+        requestedModel: event.requested_model,
+        resolvedModel: event.resolved_model,
+        status: event.status,
+        inputTokens: event.input_tokens || 0,
+        outputTokens: event.output_tokens || 0,
+        totalTokens: event.total_tokens || 0,
+        cachedTokens: event.cache_read_tokens || 0,
+        cacheWriteTokens: (event.cache_write_tokens || 0) + (event.cache_write_1h_tokens || 0),
+        providerCost: event.provider_cost,
+        costCurrency: event.cost_currency,
+        costSource: event.cost_source,
+        durationMs: event.duration_ms,
+        startedAt: event.started_at,
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get("/api-connections/:connectionId/models", async (req, res) => {
   try {
     const { data: connection, error } = await supabase.from("api_connections").select("*")
@@ -2583,6 +2625,7 @@ app.post("/chat", async (req, res) => {
         maxTokens: settings.max_tokens,
         messages: context,
         userId: req.user.id,
+        sessionId,
       }),
       semanticEventPromise,
     ]);

@@ -27,7 +27,7 @@ test("buildModelContext preserves stable, summary, and recent-message order", ()
 
   assert.deepEqual(context, [
     { role: "system", content: "Stable companion rules" },
-    { role: "system", content: "Ordered Markdown documents" },
+    { role: "system", content: "Ordered Markdown documents", cacheBoundary: true },
     { role: "system", content: "Character profile" },
     { role: "system", content: "User profile" },
     { role: "system", content: "Relevant memories" },
@@ -87,7 +87,7 @@ test("estimateTokens handles empty and mixed-width text deterministically", () =
   assert.equal(estimateTokens("你好a"), 2);
 });
 
-test("buildModelContextLayers exposes labels without changing model messages", () => {
+test("buildModelContextLayers exposes labels and model messages mark the fixed-document cache boundary", () => {
   const input = {
     systemPrompt: "Rules",
     topicDocuments: "Matched topic",
@@ -99,5 +99,9 @@ test("buildModelContextLayers exposes labels without changing model messages", (
     { id: "on_demand_documents", label: "本次召回的按需 MD", role: "system" },
     { id: "recent_message_1", label: "最近消息 1", role: "user" },
   ]);
-  assert.deepEqual(buildModelContext(input), layers.map(({ role, content }) => ({ role, content })));
+  assert.deepEqual(buildModelContext(input), layers.map(({ id, role, content }) => ({
+    role,
+    content,
+    ...(id === "always_documents" ? { cacheBoundary: true } : {}),
+  })));
 });
