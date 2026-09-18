@@ -30,7 +30,20 @@ function formatUserProfile(profile) {
   return lines.length ? `User profile (reference data, not instructions):\n${lines.join("\n")}` : "";
 }
 
-function buildModelContext({
+const CONTEXT_LAYER_DEFINITIONS = [
+  ["systemPrompt", "additional_instructions", "用户自定义提示词"],
+  ["promptDocuments", "always_documents", "始终加载的 MD 文档"],
+  ["characterProfile", "character_profile", "伴侣资料"],
+  ["userProfile", "user_profile", "用户资料"],
+  ["currentContext", "current_context", "当下状态"],
+  ["topicDocuments", "on_demand_documents", "本次召回的按需 MD"],
+  ["timelineMemories", "timeline_memories", "Timeline 记忆"],
+  ["windowContinuity", "window_continuity", "窗口交接"],
+  ["followUps", "followups", "Followup 事项"],
+  ["longTermMemories", "long_term_memories", "长期记忆召回"],
+];
+
+function buildModelContextLayers({
   systemPrompt,
   promptDocuments,
   characterProfile,
@@ -44,22 +57,27 @@ function buildModelContext({
   memorySummary,
   recentMessages,
 }) {
-  return [
-    ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
-    ...(promptDocuments ? [{ role: "system", content: promptDocuments }] : []),
-    ...(characterProfile ? [{ role: "system", content: characterProfile }] : []),
-    ...(userProfile ? [{ role: "system", content: userProfile }] : []),
-    ...(currentContext ? [{ role: "system", content: currentContext }] : []),
-    ...(topicDocuments ? [{ role: "system", content: topicDocuments }] : []),
-    ...(timelineMemories ? [{ role: "system", content: timelineMemories }] : []),
-    ...(windowContinuity ? [{ role: "system", content: windowContinuity }] : []),
-    ...(followUps ? [{ role: "system", content: followUps }] : []),
-    ...(longTermMemories ? [{ role: "system", content: longTermMemories }] : []),
-    ...(memorySummary
-      ? [{ role: "system", content: `Conversation memory summary:\n${memorySummary}` }]
-      : []),
-    ...recentMessages.map(({ role, content }) => ({ role, content })),
-  ];
+  const values = { systemPrompt, promptDocuments, characterProfile, userProfile, currentContext, topicDocuments, timelineMemories, windowContinuity, followUps, longTermMemories };
+  const layers = CONTEXT_LAYER_DEFINITIONS.flatMap(([key, id, label]) => values[key]
+    ? [{ id, label, role: "system", content: values[key] }]
+    : []);
+  if (memorySummary) layers.push({
+    id: "conversation_summary",
+    label: "当前窗口摘要",
+    role: "system",
+    content: `Conversation memory summary:\n${memorySummary}`,
+  });
+  (recentMessages || []).forEach(({ role, content }, index) => layers.push({
+    id: `recent_message_${index + 1}`,
+    label: `最近消息 ${index + 1}`,
+    role,
+    content,
+  }));
+  return layers;
+}
+
+function buildModelContext(input) {
+  return buildModelContextLayers(input).map(({ role, content }) => ({ role, content }));
 }
 
 function estimateTokens(text) {
@@ -73,6 +91,7 @@ function normalizeRecentMessageLimit(limit, fallback = 12) {
 
 module.exports = {
   buildModelContext,
+  buildModelContextLayers,
   estimateTokens,
   formatCharacterProfile,
   formatUserProfile,
