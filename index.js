@@ -13,6 +13,7 @@ const {
   normalizeRecentMessageLimit,
 } = require("./core/context");
 const { prepareMessagesForProvider } = require("./core/promptCaching");
+const { calculateUsageCosts, normalizeOpenRouterPricing, shanghaiPeriodStarts } = require("./core/usageCosts");
 const {
   MEMORY_CATEGORIES,
   formatLongTermMemories,
@@ -80,6 +81,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
 const modelCatalogCache = new Map();
+let openRouterPricingCache = { loadedAt: 0, prices: new Map() };
 
 const DEFAULT_SETTINGS = {
   system_prompt: "You are a warm, thoughtful AI companion. Respond naturally and supportively.",
@@ -2240,15 +2242,50 @@ app.get("/api-usage-events", async (req, res) => {
   try {
     const requestedLimit = Number.parseInt(req.query.limit, 10);
     const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? requestedLimit : 30));
+    const periodStarts = shanghaiPeriodStarts();
     const { data, error } = await supabase.from("api_usage_events")
       .select("id,purpose,provider,requested_model,resolved_model,status,input_tokens,output_tokens,total_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,provider_cost,cost_currency,cost_source,duration_ms,started_at")
       .eq("user_id", req.user.id)
+      .gte("started_at", periodStarts.month.toISOString())
       .order("started_at", { ascending: false })
-      .limit(limit);
+      .limit(5000);
     if (error) throw error;
+    const events = data || [];
+    if (events.some((event) => event.provider === "openrouter")
+      && Date.now() - openRouterPricingCache.loadedAt > 24 * 60 * 60 * 1000) {
+      try {
+        const response = await fetch("https://openrouter.ai/api/v1/models", { signal: AbortSignal.timeout(15000) });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        openRouterPricingCache = {
+          loadedAt: Date.now(),
+          prices: normalizeOpenRouterPricing(await response.json()),
+        };
+      } catch (pricingError) {
+        console.error("OpenRouter pricing refresh failed:", pricingError.message);
+      }
+    }
+    const pricedEvents = events.map((event) => {
+      const modelId = event.resolved_model || event.requested_model;
+      const costs = calculateUsageCosts(event, event.provider === "openrouter"
+        ? openRouterPricingCache.prices.get(modelId)
+        : null);
+      return { event, costs };
+    });
+    const summarize = (items) => items.reduce((summary, item) => ({
+      actualCost: summary.actualCost + (item.costs.actualCost || 0),
+      cacheSavings: summary.cacheSavings + (item.costs.cacheSavings || 0),
+      pricedCalls: summary.pricedCalls + (item.costs.actualCost === null ? 0 : 1),
+      totalCalls: summary.totalCalls + 1,
+    }), { actualCost: 0, cacheSavings: 0, pricedCalls: 0, totalCalls: 0 });
+    const todayEvents = pricedEvents.filter(({ event }) => new Date(event.started_at) >= periodStarts.today);
     res.json({
       success: true,
-      events: (data || []).map((event) => ({
+      exchangeRate: 6.7,
+      summary: {
+        today: summarize(todayEvents),
+        month: summarize(pricedEvents),
+      },
+      events: pricedEvents.slice(0, limit).map(({ event, costs }) => ({
         id: event.id,
         purpose: event.purpose,
         provider: event.provider,
@@ -2260,9 +2297,11 @@ app.get("/api-usage-events", async (req, res) => {
         totalTokens: event.total_tokens || 0,
         cachedTokens: event.cache_read_tokens || 0,
         cacheWriteTokens: (event.cache_write_tokens || 0) + (event.cache_write_1h_tokens || 0),
-        providerCost: event.provider_cost,
+        actualCost: costs.actualCost,
+        withoutCacheCost: costs.withoutCacheCost,
+        cacheSavings: costs.cacheSavings,
         costCurrency: event.cost_currency,
-        costSource: event.cost_source,
+        costSource: costs.costSource,
         durationMs: event.duration_ms,
         startedAt: event.started_at,
       })),
@@ -2587,17 +2626,6 @@ app.post("/chat", async (req, res) => {
     }
     const statusRelevantFollowUps = selectContextualFollowUps(statusFollowUps, message, recentHistory, 1);
     const historyChronological = [...recentHistory].reverse();
-    const semanticEventPromise = interpretSemanticEvent({
-      userId: req.user.id,
-      settings,
-      message,
-      recentMessages: recentHistory,
-      followUps: statusFollowUps,
-    }).catch((semanticError) => {
-      console.error("Semantic event interpretation failed:", semanticError);
-      return null;
-    });
-
     const context = buildModelContext({
       systemPrompt: settings.system_prompt
         ? `User-configured system instructions:\n${settings.system_prompt}`
@@ -2617,8 +2645,7 @@ app.post("/chat", async (req, res) => {
     const requestedModel = typeof req.body.model === "string" && req.body.model.trim()
       ? req.body.model.trim()
       : settings.model;
-    const [reply, semanticEventSuggestion] = await Promise.all([
-      callModel({
+    const reply = await callModel({
         purpose: "companion_chat",
         model: requestedModel,
         temperature: settings.temperature,
@@ -2626,9 +2653,7 @@ app.post("/chat", async (req, res) => {
         messages: context,
         userId: req.user.id,
         sessionId,
-      }),
-      semanticEventPromise,
-    ]);
+      });
 
     const { data: assistantMessage, error: assistantMessageError } = await supabase
       .from("messages")
@@ -2650,9 +2675,9 @@ app.post("/chat", async (req, res) => {
     }
 
     const ruleBasedSuggestion = suggestFollowUpStatus(statusRelevantFollowUps, message);
-    const followUpStatusSuggestion = semanticEventSuggestion || (ruleBasedSuggestion
+    const followUpStatusSuggestion = ruleBasedSuggestion
       ? { action: "update", ...ruleBasedSuggestion }
-      : null);
+      : null;
     const explicitMemory = parseExplicitMemoryRequest(message);
     const explicitFollowUp = parseExplicitFollowUpRequest(message);
     let capturedMemoryId = null;
