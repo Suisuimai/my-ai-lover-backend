@@ -5,6 +5,7 @@ const {
   buildModelContext,
   buildModelContextLayers,
   estimateTokens,
+  formatCurrentTime,
   formatCharacterProfile,
   formatUserProfile,
   normalizeRecentMessageLimit,
@@ -34,6 +35,10 @@ test("buildModelContext preserves stable, summary, and recent-message order", ()
     { role: "user", content: "Hello" },
     { role: "assistant", content: "Hi" },
   ]);
+});
+
+test("formats current time in China Standard Time", () => {
+  assert.equal(formatCurrentTime(new Date("2026-09-18T11:30:00Z")), "当前时间：2026-09-18 19:30 CST（中国标准时间）");
 });
 
 test("profile formatters omit empty fields and label data as non-instructions", () => {

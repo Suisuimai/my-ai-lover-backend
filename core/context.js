@@ -84,6 +84,14 @@ function estimateTokens(text) {
   return Math.ceil((text || "").length / 2);
 }
 
+function formatCurrentTime(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(date).reduce((result, part) => ({ ...result, [part.type]: part.value }), {});
+  return `当前时间：${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} CST（中国标准时间）`;
+}
+
 function normalizeRecentMessageLimit(limit, fallback = 12) {
   const safeLimit = Math.max(2, Number(limit) || fallback);
   return safeLimit % 2 === 0 ? safeLimit : safeLimit + 1;
@@ -93,6 +101,7 @@ module.exports = {
   buildModelContext,
   buildModelContextLayers,
   estimateTokens,
+  formatCurrentTime,
   formatCharacterProfile,
   formatUserProfile,
   normalizeRecentMessageLimit,
