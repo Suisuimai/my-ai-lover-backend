@@ -2549,29 +2549,111 @@ app.delete("/settings/credentials/:provider", async (req, res) => {
   }
 });
 
-// Core chat: persist user message, assemble the three-layer context, call model, persist assistant reply.
+function validUuid(value) {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+async function completedChatRequestResponse(request, userId) {
+  const [{ data: assistant, error: assistantError }, { data: session, error: sessionError }] = await Promise.all([
+    supabase.from("messages").select("id,content").eq("id", request.assistant_message_id).maybeSingle(),
+    supabase.from("sessions").select("id,name").eq("id", request.session_id).eq("user_id", userId).maybeSingle(),
+  ]);
+  if (assistantError || sessionError) throw assistantError || sessionError;
+  if (!assistant || !session) throw new Error("Completed chat result is no longer available");
+  return {
+    success: true,
+    requestStatus: "succeeded",
+    clientRequestId: request.id,
+    sessionId: session.id,
+    title: session.name,
+    reply: assistant.content,
+    messageId: assistant.id,
+    recovered: true,
+  };
+}
+
+app.get("/chat-requests/:requestId", async (req, res) => {
+  if (!validUuid(req.params.requestId)) return res.status(400).json({ success: false, error: "Invalid request ID" });
+  try {
+    const { data: request, error } = await supabase.from("chat_requests").select("*")
+      .eq("id", req.params.requestId).eq("user_id", req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!request) return res.status(404).json({ success: false, error: "Chat request not found" });
+    if (request.status === "succeeded") return res.json(await completedChatRequestResponse(request, req.user.id));
+    res.json({ success: true, requestStatus: request.status, clientRequestId: request.id, sessionId: request.session_id });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Core chat: persist user message, assemble context, call model, and keep retries idempotent.
 app.post("/chat", async (req, res) => {
   const message = typeof req.body.message === "string" ? req.body.message.trim() : "";
   if (!message) return res.status(400).json({ success: false, error: "A message is required" });
+  const clientRequestId = req.body.clientRequestId;
+  if (!validUuid(clientRequestId)) return res.status(400).json({ success: false, error: "A valid clientRequestId is required" });
 
+  let trackedRequest = null;
   try {
-    let sessionId = req.body.sessionId;
+    const { data: existingRequest, error: existingRequestError } = await supabase.from("chat_requests").select("*")
+      .eq("id", clientRequestId).eq("user_id", req.user.id).maybeSingle();
+    if (existingRequestError) throw existingRequestError;
+    if (existingRequest?.request_text !== undefined && existingRequest.request_text !== message) {
+      return res.status(409).json({ success: false, error: "This retry ID belongs to different text" });
+    }
+    if (existingRequest?.status === "succeeded") {
+      return res.json(await completedChatRequestResponse(existingRequest, req.user.id));
+    }
+    if (existingRequest?.status === "pending") {
+      return res.status(202).json({ success: true, requestStatus: "pending", clientRequestId, sessionId: existingRequest.session_id });
+    }
+
+    let sessionId = existingRequest?.session_id || req.body.sessionId;
     let isNewSession = false;
 
-    if (!sessionId) {
+    if (existingRequest) {
+      req.sessionRecord = await requireOwnedSession(sessionId, req.user.id);
+      const { data, error } = await supabase.from("chat_requests").update({
+        status: "pending", error_code: null, updated_at: new Date().toISOString(), completed_at: null,
+      }).eq("id", clientRequestId).eq("user_id", req.user.id).select().single();
+      if (error) throw error;
+      trackedRequest = data;
+    } else if (!sessionId) {
       const session = await createSession(req.user.id, DEFAULT_SESSION_NAME, req.body.characterId);
       sessionId = session.id;
       req.sessionRecord = session;
       isNewSession = true;
-    }
-    else {
+    } else {
       req.sessionRecord = await requireOwnedSession(sessionId, req.user.id);
     }
 
-    const { error: userMessageError } = await supabase
-      .from("messages")
-      .insert({ session_id: sessionId, role: "user", content: message, is_visible: true });
-    if (userMessageError) throw userMessageError;
+    if (!trackedRequest) {
+      const { data, error } = await supabase.from("chat_requests").insert({
+        id: clientRequestId, user_id: req.user.id, session_id: sessionId, request_text: message, status: "pending",
+      }).select().single();
+      if (error) throw error;
+      trackedRequest = data;
+    }
+
+    if (!trackedRequest.user_message_id) {
+      const { data: userMessage, error: userMessageError } = await supabase
+        .from("messages")
+        .insert({ session_id: sessionId, role: "user", content: message, is_visible: true })
+        .select("id").single();
+      if (userMessageError) throw userMessageError;
+      const { data, error } = await supabase.from("chat_requests").update({
+        user_message_id: userMessage.id, updated_at: new Date().toISOString(),
+      }).eq("id", clientRequestId).eq("user_id", req.user.id).select().single();
+      if (error) throw error;
+      trackedRequest = data;
+    }
+
+    const { error: heartbeatResetError } = await supabase.from("heartbeat_settings").update({
+      last_chat_at: new Date().toISOString(),
+      next_due_at: null,
+      updated_at: new Date().toISOString(),
+    }).eq("user_id", req.user.id);
+    if (heartbeatResetError) console.error("Heartbeat timer reset failed:", heartbeatResetError.code || "database_error");
 
     const settings = await getSettings(req.user.id);
     const character = req.sessionRecord.character_id
@@ -2709,8 +2791,19 @@ app.post("/chat", async (req, res) => {
       }
     }
 
+    const { error: requestUpdateError } = await supabase.from("chat_requests").update({
+      status: "succeeded",
+      assistant_message_id: assistantMessage.id,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      error_code: null,
+    }).eq("id", clientRequestId).eq("user_id", req.user.id);
+    if (requestUpdateError) console.error("Chat request completion tracking failed:", requestUpdateError);
+
     res.json({
       success: true,
+      requestStatus: "succeeded",
+      clientRequestId,
       sessionId,
       title,
       reply,
@@ -2721,7 +2814,19 @@ app.post("/chat", async (req, res) => {
     });
   } catch (error) {
     console.error("Chat failed:", error);
-    res.status(500).json({ success: false, error: error.message, reply: "Sorry, I could not reply just now." });
+    if (trackedRequest?.id) {
+      try {
+        await supabase.from("chat_requests").update({
+          status: "failed",
+          error_code: error?.code ? String(error.code).slice(0, 120) : "chat_failed",
+          completed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }).eq("id", trackedRequest.id).eq("user_id", req.user.id);
+      } catch {
+        console.error("Chat request failure tracking failed");
+      }
+    }
+    res.status(500).json({ success: false, error: "这条消息暂时没有发送成功，请重试。" });
   }
 });
 
