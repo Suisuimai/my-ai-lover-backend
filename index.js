@@ -237,7 +237,44 @@ async function recordModelUsage(event) {
   }
 }
 
-async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified" }) {
+async function readModelEventStream(response, { providerType, onDelta }) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let finalData = {};
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || "";
+    for (const event of events) {
+      for (const line of event.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const raw = line.slice(5).trim();
+        if (!raw || raw === "[DONE]") continue;
+        let data;
+        try { data = JSON.parse(raw); } catch { continue; }
+        finalData = data.usage ? { ...finalData, ...data } : finalData;
+        const delta = providerType === "anthropic"
+          ? (data.type === "content_block_delta" ? data.delta?.text : "")
+          : data.choices?.[0]?.delta?.content;
+        if (delta) {
+          text += delta;
+          onDelta(delta, text);
+        }
+        if (providerType === "anthropic" && data.type === "message_start") finalData = data.message || finalData;
+        if (providerType === "anthropic" && data.type === "message_delta") {
+          finalData = { ...finalData, usage: { ...(finalData.usage || {}), ...(data.usage || {}) } };
+        }
+      }
+    }
+  }
+  return { text: text.trim(), data: finalData };
+}
+
+async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, signal }) {
   const startedAt = new Date();
   const startedClock = Date.now();
   let provider;
@@ -273,9 +310,21 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
           ...(provider.name === "openrouter" && sessionId ? { session_id: sessionId } : {}),
           ...(responseFormat ? { response_format: { type: responseFormat } } : {}),
           ...(provider.name === "deepseek" && thinking ? { thinking: { type: thinking } } : {}),
+          ...(onDelta ? { stream: true, stream_options: { include_usage: true } } : {}),
         }),
+        signal,
       });
 
+      if (onDelta && response.ok) {
+        const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta });
+        responseData = streamed.data;
+        const text = streamed.text;
+        if (!text) { errorCode = "empty_reply"; throw new Error(`${provider.name} returned an empty streamed reply`); }
+        status = "succeeded";
+        resolvedModel = responseData.model || model;
+        providerRequestId = responseData.id || response.headers.get("x-request-id");
+        return text;
+      }
       responseData = await response.json();
       errorCode = apiErrorCode(responseData, response.status);
       if (!response.ok) throw new Error(responseData.error?.message || `${provider.name} request failed`);
@@ -318,9 +367,21 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
         temperature,
         max_tokens: maxTokens,
         messages: conversation,
+        ...(onDelta ? { stream: true } : {}),
       }),
+      signal,
     });
 
+    if (onDelta && response.ok) {
+      const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta });
+      responseData = streamed.data;
+      const text = streamed.text;
+      if (!text) { errorCode = "empty_reply"; throw new Error("Anthropic returned an empty streamed reply"); }
+      status = "succeeded";
+      resolvedModel = responseData.model || model;
+      providerRequestId = responseData.id || response.headers.get("request-id");
+      return text;
+    }
     responseData = await response.json();
     errorCode = apiErrorCode(responseData, response.status);
     if (!response.ok) throw new Error(responseData.error?.message || "Anthropic request failed");
@@ -384,6 +445,7 @@ async function maybeCompressMemory(sessionId, settings, userId) {
     .select("role, content, created_at")
     .eq("session_id", sessionId)
     .eq("is_visible", true)
+    .eq("context_status", "active")
     .order("created_at", { ascending: true });
   if (messagesError) throw messagesError;
 
@@ -1288,7 +1350,7 @@ app.post("/handoffs/generate", async (req, res) => {
     const settings = await getSettings(req.user.id);
     const [{ data: messages, error: messagesError }, { data: memory, error: memoryError }] = await Promise.all([
       supabase.from("messages").select("id,role,content,created_at")
-        .eq("session_id", sourceSessionId).eq("is_visible", true)
+        .eq("session_id", sourceSessionId).eq("is_visible", true).eq("context_status", "active")
         .order("created_at", { ascending: false }).limit(40),
       supabase.from("session_memories").select("summary").eq("session_id", sourceSessionId).maybeSingle(),
     ]);
@@ -1337,7 +1399,7 @@ app.post("/handoffs", async (req, res) => {
     let tailMessageIds = await ownedMessageIds(req.body.tailMessageIds, sourceSessionId, 12);
     if (!tailMessageIds.length) {
       const { data: tail, error: tailError } = await supabase.from("messages").select("id")
-        .eq("session_id", sourceSessionId).eq("is_visible", true)
+        .eq("session_id", sourceSessionId).eq("is_visible", true).eq("context_status", "active")
         .order("created_at", { ascending: false }).limit(8);
       if (tailError) throw tailError;
       tailMessageIds = (tail || []).reverse().map((item) => item.id);
@@ -1673,7 +1735,7 @@ async function readVisibleMessages(sessionId, userId) {
   await requireOwnedSession(sessionId, userId);
   const { data, error } = await supabase
     .from("messages")
-    .select("id, session_id, role, content, is_visible, created_at")
+    .select("id, session_id, role, content, is_visible, context_status, replaces_message_id, created_at")
     .eq("session_id", sessionId)
     .eq("is_visible", true)
     .order("created_at", { ascending: true });
@@ -1745,7 +1807,7 @@ app.post("/prompt-preview", async (req, res) => {
         ? supabase.from("session_memories").select("summary").eq("session_id", sessionId).maybeSingle()
         : Promise.resolve({ data: null, error: null }),
       sessionId
-        ? supabase.from("messages").select("role,content").eq("session_id", sessionId).eq("is_visible", true)
+        ? supabase.from("messages").select("role,content").eq("session_id", sessionId).eq("is_visible", true).eq("context_status", "active")
           .order("created_at", { ascending: false }).limit(normalizeRecentMessageLimit(settings.recent_message_limit))
         : Promise.resolve({ data: [], error: null }),
     ]);
@@ -2586,6 +2648,22 @@ app.get("/chat-requests/:requestId", async (req, res) => {
   }
 });
 
+const activeChatControllers = new Map();
+
+app.post("/chat-requests/:requestId/cancel", async (req, res) => {
+  if (!validUuid(req.params.requestId)) return res.status(400).json({ success: false, error: "Invalid request ID" });
+  try {
+    const { data: request, error } = await supabase.from("chat_requests").select("id,status")
+      .eq("id", req.params.requestId).eq("user_id", req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!request) return res.status(404).json({ success: false, error: "Chat request not found" });
+    activeChatControllers.get(request.id)?.abort();
+    res.json({ success: true, requestStatus: request.status === "pending" ? "cancelling" : request.status });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Core chat: persist user message, assemble context, call model, and keep retries idempotent.
 app.post("/chat", async (req, res) => {
   const message = typeof req.body.message === "string" ? req.body.message.trim() : "";
@@ -2593,19 +2671,49 @@ app.post("/chat", async (req, res) => {
   const clientRequestId = req.body.clientRequestId;
   if (!validUuid(clientRequestId)) return res.status(400).json({ success: false, error: "A valid clientRequestId is required" });
 
+  const wantsStream = req.headers.accept?.includes("text/event-stream");
+  const operation = ["send", "regenerate", "edit"].includes(req.body.operation) ? req.body.operation : "send";
+  const targetMessageId = req.body.targetMessageId;
+  const abortController = new AbortController();
   let trackedRequest = null;
+  let streamedReply = "";
+  let streamClosed = false;
+  const sendStreamEvent = (event, data) => {
+    if (!wantsStream || res.writableEnded || res.destroyed) return;
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  if (wantsStream) {
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+  }
   try {
     const { data: existingRequest, error: existingRequestError } = await supabase.from("chat_requests").select("*")
       .eq("id", clientRequestId).eq("user_id", req.user.id).maybeSingle();
     if (existingRequestError) throw existingRequestError;
     if (existingRequest?.request_text !== undefined && existingRequest.request_text !== message) {
+      if (wantsStream) {
+        sendStreamEvent("error", { error: "This retry ID belongs to different text" });
+        return res.end();
+      }
       return res.status(409).json({ success: false, error: "This retry ID belongs to different text" });
     }
     if (existingRequest?.status === "succeeded") {
-      return res.json(await completedChatRequestResponse(existingRequest, req.user.id));
+      const completed = await completedChatRequestResponse(existingRequest, req.user.id);
+      if (wantsStream) {
+        sendStreamEvent("done", completed);
+        return res.end();
+      }
+      return res.json(completed);
     }
     if (existingRequest?.status === "pending") {
-      return res.status(202).json({ success: true, requestStatus: "pending", clientRequestId, sessionId: existingRequest.session_id });
+      const pending = { success: true, requestStatus: "pending", clientRequestId, sessionId: existingRequest.session_id };
+      if (wantsStream) {
+        sendStreamEvent("error", { ...pending, error: "这条回复仍在生成，请稍后再试。" });
+        return res.end();
+      }
+      return res.status(202).json(pending);
     }
 
     let sessionId = existingRequest?.session_id || req.body.sessionId;
@@ -2635,7 +2743,42 @@ app.post("/chat", async (req, res) => {
       trackedRequest = data;
     }
 
-    if (!trackedRequest.user_message_id) {
+    activeChatControllers.set(clientRequestId, abortController);
+
+    if (operation !== "send") {
+      const { data: target, error: targetError } = await supabase.from("messages")
+        .select("id,session_id,role,content,created_at")
+        .eq("id", targetMessageId).eq("session_id", sessionId).maybeSingle();
+      if (targetError) throw targetError;
+      const expectedRole = operation === "edit" ? "user" : "assistant";
+      if (!target || target.role !== expectedRole) {
+        const invalidTarget = new Error(`A valid ${expectedRole} target message is required`);
+        invalidTarget.status = 400;
+        throw invalidTarget;
+      }
+      if (operation === "edit") {
+        const { error: updateError } = await supabase.from("messages").update({ content: message, context_status: "active" }).eq("id", target.id);
+        if (updateError) throw updateError;
+        const { error: discardError } = await supabase.from("messages").update({ context_status: "discarded", is_visible: false })
+          .eq("session_id", sessionId).gt("created_at", target.created_at);
+        if (discardError) throw discardError;
+        trackedRequest.user_message_id = target.id;
+        await supabase.from("chat_requests").update({ user_message_id: target.id }).eq("id", clientRequestId);
+      } else {
+        const { error: alternativeError } = await supabase.from("messages").update({ context_status: "alternative" }).eq("id", target.id);
+        if (alternativeError) throw alternativeError;
+        const { data: precedingUser, error: precedingError } = await supabase.from("messages").select("id")
+          .eq("session_id", sessionId).eq("role", "user").eq("context_status", "active")
+          .lt("created_at", target.created_at).order("created_at", { ascending: false }).limit(1).maybeSingle();
+        if (precedingError) throw precedingError;
+        if (precedingUser) {
+          trackedRequest.user_message_id = precedingUser.id;
+          await supabase.from("chat_requests").update({ user_message_id: precedingUser.id }).eq("id", clientRequestId);
+        }
+      }
+    }
+
+    if (!trackedRequest.user_message_id && operation === "send") {
       const { data: userMessage, error: userMessageError } = await supabase
         .from("messages")
         .insert({ session_id: sessionId, role: "user", content: message, is_visible: true })
@@ -2698,6 +2841,7 @@ app.post("/chat", async (req, res) => {
       .select("role, content")
       .eq("session_id", sessionId)
       .eq("is_visible", true)
+      .eq("context_status", "active")
       .order("created_at", { ascending: false })
       .limit(normalizeRecentMessageLimit(settings.recent_message_limit));
     if (historyError) throw historyError;
@@ -2735,11 +2879,23 @@ app.post("/chat", async (req, res) => {
         messages: context,
         userId: req.user.id,
         sessionId,
+        signal: abortController.signal,
+        onDelta: wantsStream ? (delta, complete) => {
+          streamedReply = complete;
+          sendStreamEvent("delta", { delta });
+        } : undefined,
       });
 
     const { data: assistantMessage, error: assistantMessageError } = await supabase
       .from("messages")
-      .insert({ session_id: sessionId, role: "assistant", content: reply, is_visible: true })
+      .insert({
+        session_id: sessionId,
+        role: "assistant",
+        content: reply,
+        is_visible: true,
+        context_status: "active",
+        ...(operation === "regenerate" ? { replaces_message_id: targetMessageId } : {}),
+      })
       .select()
       .single();
     if (assistantMessageError) throw assistantMessageError;
@@ -2800,7 +2956,7 @@ app.post("/chat", async (req, res) => {
     }).eq("id", clientRequestId).eq("user_id", req.user.id);
     if (requestUpdateError) console.error("Chat request completion tracking failed:", requestUpdateError);
 
-    res.json({
+    const responsePayload = {
       success: true,
       requestStatus: "succeeded",
       clientRequestId,
@@ -2811,13 +2967,51 @@ app.post("/chat", async (req, res) => {
       memoryCapture: explicitMemory ? (capturedMemoryId ? "saved" : "failed") : "automatic_disabled",
       followUpCapture,
       followUpStatusSuggestion,
-    });
+      operation,
+      targetMessageId: targetMessageId || null,
+    };
+    if (wantsStream) {
+      sendStreamEvent("done", responsePayload);
+      streamClosed = true;
+      res.end();
+    } else {
+      res.json(responsePayload);
+    }
   } catch (error) {
     console.error("Chat failed:", error);
+    const cancelled = error?.name === "AbortError" || abortController.signal.aborted;
+    if (cancelled && trackedRequest?.session_id) {
+      try {
+        let partialMessage = null;
+        if (streamedReply.trim()) {
+          const { data, error: partialInsertError } = await supabase.from("messages").insert({
+            session_id: trackedRequest.session_id,
+            role: "assistant",
+            content: streamedReply.trim(),
+            is_visible: true,
+            context_status: "active",
+            ...(operation === "regenerate" ? { replaces_message_id: targetMessageId } : {}),
+          }).select("id").single();
+          if (partialInsertError) throw partialInsertError;
+          partialMessage = data;
+        }
+        await supabase.from("chat_requests").update({
+          status: "cancelled", partial_content: streamedReply.trim() || null, assistant_message_id: partialMessage?.id || null,
+          completed_at: new Date().toISOString(), updated_at: new Date().toISOString(), error_code: null,
+        }).eq("id", trackedRequest.id).eq("user_id", req.user.id);
+        if (wantsStream) {
+          sendStreamEvent("cancelled", { requestStatus: "cancelled", reply: streamedReply.trim(), messageId: partialMessage?.id || null, sessionId: trackedRequest.session_id });
+          streamClosed = true;
+          return res.end();
+        }
+      } catch (partialError) {
+        console.error("Partial reply save failed:", partialError);
+      }
+    }
     if (trackedRequest?.id) {
       try {
         await supabase.from("chat_requests").update({
-          status: "failed",
+          status: cancelled ? "cancelled" : "failed",
           error_code: error?.code ? String(error.code).slice(0, 120) : "chat_failed",
           completed_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
@@ -2826,7 +3020,13 @@ app.post("/chat", async (req, res) => {
         console.error("Chat request failure tracking failed");
       }
     }
-    res.status(500).json({ success: false, error: "这条消息暂时没有发送成功，请重试。" });
+    if (wantsStream) {
+      if (!streamClosed) sendStreamEvent("error", { error: cancelled ? "已停止生成" : "这条消息暂时没有发送成功，请重试。" });
+      return res.end();
+    }
+    res.status(cancelled ? 409 : 500).json({ success: false, error: cancelled ? "已停止生成" : "这条消息暂时没有发送成功，请重试。" });
+  } finally {
+    activeChatControllers.delete(clientRequestId);
   }
 });
 
