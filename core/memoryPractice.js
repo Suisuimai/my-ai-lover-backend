@@ -18,6 +18,13 @@ function stripTransientCitations(value) {
   return String(value || "").replace(/\[(?:M\d+|S\d+-M\d+)\]/gi, "").replace(/[ \t]+\n/g, "\n").replace(/ {2,}/g, " ").trim();
 }
 
+function replaceTechnicalRoleLabels(value, { characterName = "", userName = "" } = {}) {
+  let result = String(value || "");
+  if (characterName) result = result.replace(/\b(?:Companion|Assistant)\b/gi, characterName);
+  if (userName) result = result.replace(/\bUser\b/gi, userName);
+  return result;
+}
+
 function evidenceFromNumbers(numbers, sourceMessages, limit = 8) {
   const normalized = [...new Set((Array.isArray(numbers) ? numbers : []).filter(Number.isInteger))].slice(0, limit);
   if (!normalized.length || normalized.some((number) => number < 1 || number > sourceMessages.length)) {
@@ -102,10 +109,11 @@ function buildExtractionPrompt(numberedTranscript, startedAt, endedAt) {
   ].join("\n\n");
 }
 
-function buildExperienceExtractionPrompt(numberedTranscript, startedAt, endedAt) {
+function buildExperienceExtractionPrompt(numberedTranscript, startedAt, endedAt, identities = {}) {
   return [
     "Extract only grounded dated experiences from an AI-companion conversation. Return JSON only.",
     "Write title, narrative_markdown, current_state, index_summary, and all search anchors in Simplified Chinese. Preserve proper names and exact quoted phrases in their original language.",
+    `Identity map: Assistant/Companion is ${identities.characterName || "the companion"}; User is ${identities.userName || "the user"}. Role labels are not additional people. Use the real names in durable text.`,
     "Return 0-3 experiences. Do not return knowledge_notes or handoff.",
     "Do not invent causes, feelings, decisions, or outcomes. Every factual claim must cite evidence_message_numbers.",
     "Each search_anchors object must contain arrays named people_places, event_names, key_objects, special_phrases, synonyms, final_state_terms.",
@@ -116,10 +124,11 @@ function buildExperienceExtractionPrompt(numberedTranscript, startedAt, endedAt)
   ].join("\n\n");
 }
 
-function buildSupportExtractionPrompt(numberedTranscript, startedAt, endedAt, documents = []) {
+function buildSupportExtractionPrompt(numberedTranscript, startedAt, endedAt, documents = [], identities = {}) {
   return [
     "Extract only Knowledge File notes and window-handoff material from an AI-companion conversation. Return JSON only.",
     "Write note_markdown and handoff fields in Simplified Chinese. Preserve proper names and exact quoted phrases in their original language.",
+    `Identity map: Assistant/Companion is ${identities.characterName || "the companion"}; User is ${identities.userName || "the user"}. Role labels are not additional people. Use the real names in durable text.`,
     "Do not return experiences. Create 0-4 concise knowledge notes. Do not rewrite a complete knowledge file.",
     "A single explicit boundary, agreement, secret, major event, or direct correction MUST become a knowledge note when it clearly belongs in a durable Knowledge File. Ordinary scene details and temporary roleplay actions are not durable notes.",
     "Route each note to one existing target_document_id from the catalog when it clearly fits. Otherwise use null; never invent an ID.",
@@ -131,10 +140,12 @@ function buildSupportExtractionPrompt(numberedTranscript, startedAt, endedAt, do
   ].join("\n\n");
 }
 
-function buildImportDistillationPrompt({ experiences, documents }) {
+function buildImportDistillationPrompt({ experiences, documents, identities = {} }) {
   return [
     "Turn a group of grounded conversation experiences into conservative Knowledge File notes. Return JSON only.",
     "Write all notes in Simplified Chinese. Preserve proper names and exact quoted phrases in their original language.",
+    `Identity map: Assistant/Companion is ${identities.characterName || "the companion"}; User is ${identities.userName || "the user"}. Never treat Assistant, Companion, or User as additional people; replace those technical role labels with the real names.`,
+    "When an older experience summary conflicts with the role shown on its quoted evidence, trust the evidence role and correct the names and direction of the interaction.",
     "This is a collecting step, not a full-file rewrite. Return 0-8 concise notes that could later update an existing Markdown file.",
     "Ordinary preferences or interaction patterns require support from at least 2 separate experiences. A single explicit agreement, secret, boundary, major event, or direct correction may be kept once.",
     "Exclude temporary roleplay scenery, filler, duplicated wording, speculation, and inferred feelings or motives.",
@@ -145,7 +156,7 @@ function buildImportDistillationPrompt({ experiences, documents }) {
   ].join("\n\n");
 }
 
-function parseImportDistillation(raw, allowedExperienceIds, documents) {
+function parseImportDistillation(raw, allowedExperienceIds, documents, identities = {}) {
   const parsed = parseJsonObject(raw);
   const allowed = new Set(allowedExperienceIds);
   const documentMap = new Map(documents.map((document) => [document.id, document.name]));
@@ -156,7 +167,7 @@ function parseImportDistillation(raw, allowedExperienceIds, documents) {
     }
     const targetDocumentId = documentMap.has(item.target_document_id) ? item.target_document_id : null;
     const suggestedDocumentName = String(item.suggested_document_name || (targetDocumentId ? documentMap.get(targetDocumentId) : "")).trim().slice(0, 120);
-    const noteMarkdown = stripTransientCitations(item.note_markdown).slice(0, 6000);
+    const noteMarkdown = replaceTechnicalRoleLabels(stripTransientCitations(item.note_markdown), identities).slice(0, 6000);
     if (!suggestedDocumentName || !noteMarkdown) throw new Error("An import-level knowledge note is incomplete");
     return {
       suggestedDocumentName,
@@ -259,5 +270,5 @@ module.exports = {
   buildDocumentMergePrompt, buildImportDistillationPrompt, buildVerificationPrompt, normalizeAnchors, parseDocumentMerge,
   parseImportDistillation,
   parseExperienceExtraction, parseMemoryExtraction, parseMemoryVerification, parseSupportExtraction,
-  stripTransientCitations,
+  replaceTechnicalRoleLabels, stripTransientCitations,
 };

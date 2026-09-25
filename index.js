@@ -1995,7 +1995,13 @@ app.post("/memory-practice/segments/:segmentId/extract", async (req, res) => {
     if (error) throw error;
     if (!segment) return res.status(404).json({ success: false, error: "Imported segment not found" });
     const settings = await getSettings(req.user.id);
-    const documents = (await loadPromptDocuments(req.user.id, segment.character_id)).filter((document) => document.load_mode !== "archive");
+    const [allDocuments, character, userProfile] = await Promise.all([
+      loadPromptDocuments(req.user.id, segment.character_id),
+      getOwnedCharacter(segment.character_id, req.user.id),
+      getOrCreateUserProfile(req.user.id),
+    ]);
+    const documents = allDocuments.filter((document) => document.load_mode !== "archive");
+    const identities = { characterName: character.name || "季疏", userName: userProfile.display_name || "好好" };
     const sourceMessages = (segment.raw_messages || []).map((message) => ({
       role: message.role,
       content: cleanClaudeSay(message.role, message.content),
@@ -2031,12 +2037,12 @@ app.post("/memory-practice/segments/:segmentId/extract", async (req, res) => {
       throw failure;
     }
     const experiencePart = await extractPart({
-      prompt: buildExperienceExtractionPrompt(numberedTranscript, segment.started_at, segment.ended_at),
+      prompt: buildExperienceExtractionPrompt(numberedTranscript, segment.started_at, segment.ended_at, identities),
       parser: parseExperienceExtraction,
       maxTokens: 2200,
     });
     const supportPart = await extractPart({
-      prompt: buildSupportExtractionPrompt(numberedTranscript, segment.started_at, segment.ended_at, documents),
+      prompt: buildSupportExtractionPrompt(numberedTranscript, segment.started_at, segment.ended_at, documents, identities),
       parser: parseSupportExtraction,
       maxTokens: 2200,
     });
@@ -2166,13 +2172,16 @@ app.post("/memory-practice/workspaces/:workspaceId/distill", async (req, res) =>
     if (batchError) throw batchError;
     const batchIds = (batches || []).map((batch) => batch.id);
     if (!batchIds.length) return res.status(400).json({ success: false, error: "请先提取至少一个片段" });
-    const [{ data: experiences, error: experienceError }, documents] = await Promise.all([
+    const [{ data: experiences, error: experienceError }, documents, character, userProfile] = await Promise.all([
       supabase.from("memory_experience_candidates").select("*").in("batch_id", batchIds).eq("user_id", req.user.id).order("created_at"),
       loadPromptDocuments(req.user.id, workspace.character_id),
+      getOwnedCharacter(workspace.character_id, req.user.id),
+      getOrCreateUserProfile(req.user.id),
     ]);
     if (experienceError) throw experienceError;
     if (!experiences?.length) return res.status(400).json({ success: false, error: "已提取片段中还没有经历素材" });
     const activeDocuments = documents.filter((document) => document.load_mode !== "archive");
+    const identities = { characterName: character.name || "季疏", userName: userProfile.display_name || "好好" };
     if (!activeDocuments.length) return res.status(400).json({ success: false, error: "请先创建至少一份可用的 Markdown 知识文件" });
     const batchById = new Map((batches || []).map((batch) => [batch.id, batch]));
     const experienceById = new Map(experiences.map((item) => [item.id, item]));
@@ -2194,13 +2203,13 @@ app.post("/memory-practice/workspaces/:workspaceId/distill", async (req, res) =>
         temperature: 0, maxTokens: 5000, responseFormat: "json_object", thinking: "disabled",
         messages: [
           { role: "system", content: "You conservatively distill grounded experiences into Chinese Knowledge File notes. Return complete JSON only." },
-          { role: "user", content: buildImportDistillationPrompt({ experiences: material, documents: activeDocuments }) },
+          { role: "user", content: buildImportDistillationPrompt({ experiences: material, documents: activeDocuments, identities }) },
         ],
       });
-      generated.push(...parseImportDistillation(raw, group.map((item) => item.id), activeDocuments));
+      generated.push(...parseImportDistillation(raw, group.map((item) => item.id), activeDocuments, identities));
     }
     const { error: deleteError } = await supabase.from("memory_knowledge_notes").delete()
-      .in("batch_id", batchIds).eq("user_id", req.user.id).eq("source_kind", "import_distillation");
+      .in("batch_id", batchIds).eq("user_id", req.user.id).eq("status", "extracted");
     if (deleteError) throw deleteError;
     const rows = generated.map((item) => {
       const sources = item.experienceIds.map((id) => experienceById.get(id)).filter(Boolean);
