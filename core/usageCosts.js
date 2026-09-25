@@ -17,6 +17,28 @@ function normalizeOpenRouterPricing(payload) {
   }));
 }
 
+function deepSeekPricingForEvent(event) {
+  const model = String(event?.resolved_model || event?.requested_model || "").toLowerCase();
+  if (!model.includes("deepseek")) return null;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai", weekday: "short", hour: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date(event.started_at || Date.now()))
+    .reduce((result, part) => ({ ...result, [part.type]: part.value }), {});
+  const weekday = !["Sat", "Sun"].includes(parts.weekday);
+  const hour = Number(parts.hour);
+  const peak = weekday && ((hour >= 9 && hour < 12) || (hour >= 14 && hour < 18));
+  const perMillion = model.includes("pro")
+    ? (peak ? { prompt: 1.32, cacheRead: 0.044, completion: 3.96 } : { prompt: 0.66, cacheRead: 0.022, completion: 1.98 })
+    : (peak ? { prompt: 0.30, cacheRead: 0.006, completion: 1.20 } : { prompt: 0.15, cacheRead: 0.003, completion: 0.60 });
+  return {
+    prompt: perMillion.prompt / 1_000_000,
+    completion: perMillion.completion / 1_000_000,
+    cacheRead: perMillion.cacheRead / 1_000_000,
+    cacheWrite: perMillion.prompt / 1_000_000,
+    cacheWrite1h: perMillion.prompt / 1_000_000,
+  };
+}
+
 function calculateUsageCosts(event, modelPricing) {
   const providerCost = price(event.provider_cost);
   if (!modelPricing || modelPricing.prompt === null || modelPricing.completion === null) {
@@ -60,4 +82,4 @@ function shanghaiPeriodStarts(now = new Date()) {
   };
 }
 
-module.exports = { calculateUsageCosts, normalizeOpenRouterPricing, shanghaiPeriodStarts };
+module.exports = { calculateUsageCosts, deepSeekPricingForEvent, normalizeOpenRouterPricing, shanghaiPeriodStarts };

@@ -13,7 +13,7 @@ const {
   normalizeRecentMessageLimit,
 } = require("./core/context");
 const { prepareMessagesForProvider } = require("./core/promptCaching");
-const { calculateUsageCosts, normalizeOpenRouterPricing, shanghaiPeriodStarts } = require("./core/usageCosts");
+const { calculateUsageCosts, deepSeekPricingForEvent, normalizeOpenRouterPricing, shanghaiPeriodStarts } = require("./core/usageCosts");
 const {
   MEMORY_CATEGORIES,
   formatLongTermMemories,
@@ -39,10 +39,12 @@ const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentC
 const {
   buildExperienceExtractionPrompt,
   buildDocumentMergePrompt,
+  buildImportDistillationPrompt,
   buildSupportExtractionPrompt,
   buildVerificationPrompt,
   parseExperienceExtraction,
   parseDocumentMerge,
+  parseImportDistillation,
   parseMemoryVerification,
   parseSupportExtraction,
 } = require("./core/memoryPractice");
@@ -274,7 +276,7 @@ async function readModelEventStream(response, { providerType, onDelta }) {
   return { text: text.trim(), data: finalData };
 }
 
-async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, signal }) {
+async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, signal, preparationMs = null }) {
   const startedAt = new Date();
   const startedClock = Date.now();
   let provider;
@@ -284,6 +286,7 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
   let errorCode = null;
   let resolvedModel = null;
   let providerRequestId = null;
+  let firstTokenMs = null;
 
   try {
     provider = await getModelTarget({ userId, purpose, legacyModel: model });
@@ -316,7 +319,10 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
       });
 
       if (onDelta && response.ok) {
-        const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta });
+        const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta: (delta, complete) => {
+          if (firstTokenMs === null) firstTokenMs = Math.max(0, (preparationMs || 0) + Date.now() - startedClock);
+          onDelta(delta, complete);
+        } });
         responseData = streamed.data;
         const text = streamed.text;
         if (!text) { errorCode = "empty_reply"; throw new Error(`${provider.name} returned an empty streamed reply`); }
@@ -373,7 +379,10 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
     });
 
     if (onDelta && response.ok) {
-      const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta });
+      const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta: (delta, complete) => {
+        if (firstTokenMs === null) firstTokenMs = Math.max(0, (preparationMs || 0) + Date.now() - startedClock);
+        onDelta(delta, complete);
+      } });
       responseData = streamed.data;
       const text = streamed.text;
       if (!text) { errorCode = "empty_reply"; throw new Error("Anthropic returned an empty streamed reply"); }
@@ -423,6 +432,8 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
         cost_currency: usage.costCurrency,
         cost_source: usage.costSource,
         duration_ms: Math.max(0, Date.now() - startedClock),
+        preparation_ms: Number.isFinite(preparationMs) ? Math.max(0, Math.trunc(preparationMs)) : null,
+        first_token_ms: firstTokenMs,
         provider_request_id: providerRequestId,
         started_at: startedAt.toISOString(),
         completed_at: new Date().toISOString(),
@@ -1780,6 +1791,46 @@ app.post("/sessions/:sessionId/messages", async (req, res) => {
   res.status(201).json({ success: true, message: data });
 });
 
+app.post("/messages/:messageId/select-variant", async (req, res) => {
+  try {
+    const { data: selected, error: selectedError } = await supabase.from("messages")
+      .select("id,session_id,role,created_at,replaces_message_id")
+      .eq("id", req.params.messageId).maybeSingle();
+    if (selectedError) throw selectedError;
+    if (!selected || selected.role !== "assistant") return res.status(404).json({ success: false, error: "Reply variant not found" });
+    await requireOwnedSession(selected.session_id, req.user.id);
+    const { data: assistants, error: assistantsError } = await supabase.from("messages")
+      .select("id,replaces_message_id,created_at").eq("session_id", selected.session_id)
+      .eq("role", "assistant").eq("is_visible", true).order("created_at", { ascending: true });
+    if (assistantsError) throw assistantsError;
+    const byId = new Map((assistants || []).map((message) => [message.id, message]));
+    const rootOf = (message) => {
+      let current = message;
+      const seen = new Set();
+      while (current?.replaces_message_id && byId.has(current.replaces_message_id) && !seen.has(current.id)) {
+        seen.add(current.id);
+        current = byId.get(current.replaces_message_id);
+      }
+      return current?.id;
+    };
+    const rootId = rootOf(selected);
+    const variantIds = (assistants || []).filter((message) => rootOf(message) === rootId).map((message) => message.id);
+    if (variantIds.length < 2) return res.status(400).json({ success: false, error: "This reply has no alternatives" });
+    const latestVariantTime = Math.max(...(assistants || []).filter((message) => variantIds.includes(message.id)).map((message) => new Date(message.created_at).getTime()));
+    const { data: laterUser } = await supabase.from("messages").select("id").eq("session_id", selected.session_id)
+      .eq("role", "user").eq("is_visible", true).eq("context_status", "active")
+      .gt("created_at", new Date(latestVariantTime).toISOString()).limit(1).maybeSingle();
+    if (laterUser) return res.status(409).json({ success: false, error: "继续聊天后不能再切换旧回复版本" });
+    const { error: demoteError } = await supabase.from("messages").update({ context_status: "alternative" }).in("id", variantIds);
+    if (demoteError) throw demoteError;
+    const { error: selectError } = await supabase.from("messages").update({ context_status: "active" }).eq("id", selected.id);
+    if (selectError) throw selectError;
+    res.json({ success: true, selectedMessageId: selected.id, variantIds });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
 // Read-only preview of the exact context layers used by companion chat.
 app.post("/prompt-preview", async (req, res) => {
   try {
@@ -2065,7 +2116,7 @@ app.get("/memory-practice/workspaces", async (req, res) => {
     const workspaceIds = (workspaces || []).map((workspace) => workspace.id);
     const characterIds = [...new Set((workspaces || []).map((workspace) => workspace.character_id))];
     const [{ data: batches, error: batchError }, { data: patches, error: patchError }, { data: documents, error: documentError }] = await Promise.all([
-      workspaceIds.length ? supabase.from("memory_processing_batches").select("id,workspace_id,segment_id").in("workspace_id", workspaceIds).eq("user_id", req.user.id) : { data: [], error: null },
+      workspaceIds.length ? supabase.from("memory_processing_batches").select("id,workspace_id,segment_id,memory_experience_candidates(id),memory_knowledge_notes(id,status,source_kind),memory_handoff_candidates(id)").in("workspace_id", workspaceIds).eq("user_id", req.user.id) : { data: [], error: null },
       workspaceIds.length ? supabase.from("memory_document_patch_candidates").select("*").in("workspace_id", workspaceIds).eq("user_id", req.user.id) : { data: [], error: null },
       characterIds.length ? supabase.from("prompt_documents").select("id,character_id,name,document_type,load_mode").in("character_id", characterIds).eq("user_id", req.user.id).neq("load_mode", "archive").order("sort_order") : { data: [], error: null },
     ]);
@@ -2085,6 +2136,15 @@ app.get("/memory-practice/workspaces", async (req, res) => {
           ...workspace,
           extractedSegmentCount: workspaceBatches.length,
           extractedSegmentIds: workspaceBatches.map((batch) => batch.segment_id),
+          experienceCount: workspaceBatches.reduce((sum, batch) => sum + (batch.memory_experience_candidates?.length || 0), 0),
+          extractedNoteCount: workspaceBatches.reduce((sum, batch) => sum + (batch.memory_knowledge_notes || []).filter((note) => note.status === "extracted").length, 0),
+          handoffCount: workspaceBatches.reduce((sum, batch) => sum + (batch.memory_handoff_candidates?.length || 0), 0),
+          segmentResults: workspaceBatches.map((batch) => ({
+            segmentId: batch.segment_id,
+            experienceCount: batch.memory_experience_candidates?.length || 0,
+            noteCount: (batch.memory_knowledge_notes || []).filter((note) => note.source_kind === "segment_extraction" && note.status === "extracted").length,
+            handoffCount: batch.memory_handoff_candidates?.length || 0,
+          })),
           notes: (notes || []).filter((note) => ids.has(note.batch_id)),
           patches: (patches || []).filter((patch) => patch.workspace_id === workspace.id),
         };
@@ -2092,6 +2152,80 @@ app.get("/memory-practice/workspaces", async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/memory-practice/workspaces/:workspaceId/distill", async (req, res) => {
+  try {
+    const { data: workspace, error } = await supabase.from("memory_import_workspaces").select("*")
+      .eq("id", req.params.workspaceId).eq("user_id", req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!workspace) return res.status(404).json({ success: false, error: "整份导入工作区不存在" });
+    const { data: batches, error: batchError } = await supabase.from("memory_processing_batches").select("id,segment_id")
+      .eq("workspace_id", workspace.id).eq("user_id", req.user.id);
+    if (batchError) throw batchError;
+    const batchIds = (batches || []).map((batch) => batch.id);
+    if (!batchIds.length) return res.status(400).json({ success: false, error: "请先提取至少一个片段" });
+    const [{ data: experiences, error: experienceError }, documents] = await Promise.all([
+      supabase.from("memory_experience_candidates").select("*").in("batch_id", batchIds).eq("user_id", req.user.id).order("created_at"),
+      loadPromptDocuments(req.user.id, workspace.character_id),
+    ]);
+    if (experienceError) throw experienceError;
+    if (!experiences?.length) return res.status(400).json({ success: false, error: "已提取片段中还没有经历素材" });
+    const activeDocuments = documents.filter((document) => document.load_mode !== "archive");
+    if (!activeDocuments.length) return res.status(400).json({ success: false, error: "请先创建至少一份可用的 Markdown 知识文件" });
+    const batchById = new Map((batches || []).map((batch) => [batch.id, batch]));
+    const experienceById = new Map(experiences.map((item) => [item.id, item]));
+    const settings = await getSettings(req.user.id);
+    const generated = [];
+    for (let offset = 0; offset < experiences.length; offset += 20) {
+      const group = experiences.slice(offset, offset + 20);
+      const material = group.map((item) => ({
+        id: item.id,
+        segment_id: batchById.get(item.batch_id)?.segment_id,
+        title: item.title,
+        index_summary: item.index_summary,
+        current_state: item.current_state,
+        search_anchors: item.search_anchors,
+        evidence: (item.evidence_refs || []).slice(0, 4).map((entry) => ({ role: entry.role, quote: String(entry.quote || "").slice(0, 600) })),
+      }));
+      const raw = await callModel({
+        purpose: "memory_verification", model: settings.summary_model, userId: req.user.id,
+        temperature: 0, maxTokens: 5000, responseFormat: "json_object", thinking: "disabled",
+        messages: [
+          { role: "system", content: "You conservatively distill grounded experiences into Chinese Knowledge File notes. Return complete JSON only." },
+          { role: "user", content: buildImportDistillationPrompt({ experiences: material, documents: activeDocuments }) },
+        ],
+      });
+      generated.push(...parseImportDistillation(raw, group.map((item) => item.id), activeDocuments.map((document) => document.id)));
+    }
+    const { error: deleteError } = await supabase.from("memory_knowledge_notes").delete()
+      .in("batch_id", batchIds).eq("user_id", req.user.id).eq("source_kind", "import_distillation");
+    if (deleteError) throw deleteError;
+    const rows = generated.map((item) => {
+      const sources = item.experienceIds.map((id) => experienceById.get(id)).filter(Boolean);
+      const evidence = sources.flatMap((source) => (source.evidence_refs || []).map((entry) => ({
+        ...entry,
+        experienceId: source.id,
+        experienceTitle: source.title,
+        segmentId: batchById.get(source.batch_id)?.segment_id,
+      }))).slice(0, 20);
+      return {
+        batch_id: sources[0].batch_id, user_id: req.user.id, character_id: workspace.character_id,
+        suggested_document_name: item.suggestedDocumentName, note_markdown: item.noteMarkdown,
+        target_document_id: item.suggestedDocumentId, evidence_refs: evidence,
+        source_kind: "import_distillation", source_experience_ids: item.experienceIds,
+      };
+    });
+    const { data: saved, error: saveError } = rows.length
+      ? await supabase.from("memory_knowledge_notes").insert(rows).select("*")
+      : { data: [], error: null };
+    if (saveError) throw saveError;
+    await supabase.from("memory_import_workspaces").update({ updated_at: new Date().toISOString() })
+      .eq("id", workspace.id).eq("user_id", req.user.id);
+    res.json({ success: true, notes: saved || [], experienceCount: experiences.length });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -2306,7 +2440,7 @@ app.get("/api-usage-events", async (req, res) => {
     const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? requestedLimit : 30));
     const periodStarts = shanghaiPeriodStarts();
     const { data, error } = await supabase.from("api_usage_events")
-      .select("id,purpose,provider,requested_model,resolved_model,status,input_tokens,output_tokens,total_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,provider_cost,cost_currency,cost_source,duration_ms,started_at")
+      .select("id,purpose,provider,requested_model,resolved_model,status,input_tokens,output_tokens,total_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,provider_cost,cost_currency,cost_source,duration_ms,preparation_ms,first_token_ms,started_at")
       .eq("user_id", req.user.id)
       .gte("started_at", periodStarts.month.toISOString())
       .order("started_at", { ascending: false })
@@ -2328,9 +2462,10 @@ app.get("/api-usage-events", async (req, res) => {
     }
     const pricedEvents = events.map((event) => {
       const modelId = event.resolved_model || event.requested_model;
-      const costs = calculateUsageCosts(event, event.provider === "openrouter"
+      const pricing = event.provider === "openrouter"
         ? openRouterPricingCache.prices.get(modelId)
-        : null);
+        : (event.provider === "deepseek" ? deepSeekPricingForEvent(event) : null);
+      const costs = calculateUsageCosts(event, pricing);
       return { event, costs };
     });
     const summarize = (items) => items.reduce((summary, item) => ({
@@ -2365,6 +2500,8 @@ app.get("/api-usage-events", async (req, res) => {
         costCurrency: event.cost_currency,
         costSource: costs.costSource,
         durationMs: event.duration_ms,
+        preparationMs: event.preparation_ms,
+        firstTokenMs: event.first_token_ms,
         startedAt: event.started_at,
       })),
     });
@@ -2666,6 +2803,7 @@ app.post("/chat-requests/:requestId/cancel", async (req, res) => {
 
 // Core chat: persist user message, assemble context, call model, and keep retries idempotent.
 app.post("/chat", async (req, res) => {
+  const requestStartedClock = Date.now();
   const message = typeof req.body.message === "string" ? req.body.message.trim() : "";
   if (!message) return res.status(400).json({ success: false, error: "A message is required" });
   const clientRequestId = req.body.clientRequestId;
@@ -2798,55 +2936,50 @@ app.post("/chat", async (req, res) => {
     }).eq("user_id", req.user.id);
     if (heartbeatResetError) console.error("Heartbeat timer reset failed:", heartbeatResetError.code || "database_error");
 
-    const settings = await getSettings(req.user.id);
-    const character = req.sessionRecord.character_id
-      ? await getOwnedCharacter(req.sessionRecord.character_id, req.user.id)
-      : await getOrCreateDefaultCharacter(req.user.id);
-    const userProfile = await getOrCreateUserProfile(req.user.id);
-    const promptDocuments = await loadPromptDocuments(req.user.id, character.id);
+    const [settings, character, userProfile] = await Promise.all([
+      getSettings(req.user.id),
+      req.sessionRecord.character_id
+        ? getOwnedCharacter(req.sessionRecord.character_id, req.user.id)
+        : getOrCreateDefaultCharacter(req.user.id),
+      getOrCreateUserProfile(req.user.id),
+    ]);
+    const loadMemorySummary = async () => {
+      try {
+        return await maybeCompressMemory(sessionId, settings, req.user.id);
+      } catch (compressionError) {
+        console.error("Memory compression failed:", compressionError);
+        const { data: existingMemory, error: memoryError } = await supabase.from("session_memories")
+          .select("summary").eq("session_id", sessionId).maybeSingle();
+        if (memoryError) throw memoryError;
+        return existingMemory?.summary;
+      }
+    };
+    const loadRecentHistory = async () => {
+      const { data, error } = await supabase.from("messages").select("role, content")
+        .eq("session_id", sessionId).eq("is_visible", true).eq("context_status", "active")
+        .order("created_at", { ascending: false })
+        .limit(normalizeRecentMessageLimit(settings.recent_message_limit));
+      if (error) throw error;
+      return data || [];
+    };
+    const [promptDocuments, continuity, relevantMemories, statusFollowUps, memorySummary, recentHistory] = await Promise.all([
+      loadPromptDocuments(req.user.id, character.id),
+      loadWindowContinuity(req.user.id, req.sessionRecord),
+      recallMemories(req.user.id, character.id, message).catch((error) => {
+        console.error("Long-term memory recall failed:", error);
+        return [];
+      }),
+      loadStatusFollowUps(req.user.id, character.id).catch((error) => {
+        console.error("Follow-up recall failed:", error);
+        return [];
+      }),
+      loadMemorySummary(),
+      loadRecentHistory(),
+    ]);
     const onDemandDocuments = selectRelevantPromptDocuments(promptDocuments, message, 3);
-    const continuity = await loadWindowContinuity(req.user.id, req.sessionRecord);
-    let relevantMemories = [];
-    try {
-      relevantMemories = await recallMemories(req.user.id, character.id, message);
-    } catch (recallError) {
-      console.error("Long-term memory recall failed:", recallError);
-    }
-    let statusFollowUps = [];
     let relevantFollowUps = [];
-    try {
-      statusFollowUps = await loadStatusFollowUps(req.user.id, character.id);
-      const conversationalFollowUps = statusFollowUps.filter((item) => ["active", "waiting"].includes(item.status));
-      relevantFollowUps = selectRelevantFollowUps(conversationalFollowUps, message, 3);
-    } catch (followUpError) {
-      console.error("Follow-up recall failed:", followUpError);
-    }
-    let memorySummary;
-    try {
-      memorySummary = await maybeCompressMemory(sessionId, settings, req.user.id);
-    } catch (compressionError) {
-      // A temporary compression failure must not prevent the companion from replying.
-      console.error("Memory compression failed:", compressionError);
-      const { data: existingMemory, error: memoryError } = await supabase
-        .from("session_memories")
-        .select("summary")
-        .eq("session_id", sessionId)
-        .maybeSingle();
-      if (memoryError) throw memoryError;
-      memorySummary = existingMemory?.summary;
-    }
-
-    const { data: recentHistory, error: historyError } = await supabase
-      .from("messages")
-      .select("role, content")
-      .eq("session_id", sessionId)
-      .eq("is_visible", true)
-      .eq("context_status", "active")
-      .order("created_at", { ascending: false })
-      .limit(normalizeRecentMessageLimit(settings.recent_message_limit));
-    if (historyError) throw historyError;
-
     const conversationalFollowUps = statusFollowUps.filter((item) => ["active", "waiting"].includes(item.status));
+    relevantFollowUps = selectRelevantFollowUps(conversationalFollowUps, message, 3);
     if (!relevantFollowUps.length) {
       relevantFollowUps = selectContextualFollowUps(conversationalFollowUps, message, recentHistory, 1);
     }
@@ -2871,6 +3004,7 @@ app.post("/chat", async (req, res) => {
     const requestedModel = typeof req.body.model === "string" && req.body.model.trim()
       ? req.body.model.trim()
       : settings.model;
+    const preparationMs = Math.max(0, Date.now() - requestStartedClock);
     const reply = await callModel({
         purpose: "companion_chat",
         model: requestedModel,
@@ -2880,6 +3014,7 @@ app.post("/chat", async (req, res) => {
         userId: req.user.id,
         sessionId,
         signal: abortController.signal,
+        preparationMs,
         onDelta: wantsStream ? (delta, complete) => {
           streamedReply = complete;
           sendStreamEvent("delta", { delta });
@@ -2902,14 +3037,14 @@ app.post("/chat", async (req, res) => {
 
     let title;
     if (isNewSession) {
-      title = await createTitle(requestedModel, message, reply, req.user.id);
-      const { error: titleError } = await supabase
-        .from("sessions")
-        .update({ name: title, updated_at: new Date().toISOString() })
-        .eq("id", sessionId);
-      if (titleError) console.error("Session title update failed:", titleError);
+      title = message.slice(0, 16) || DEFAULT_SESSION_NAME;
+      void createTitle(requestedModel, message, reply, req.user.id).then(async (generatedTitle) => {
+        const { error: titleError } = await supabase.from("sessions")
+          .update({ name: generatedTitle, updated_at: new Date().toISOString() }).eq("id", sessionId).eq("user_id", req.user.id);
+        if (titleError) console.error("Session title update failed:", titleError);
+      }).catch((error) => console.error("Background title generation failed:", error));
     } else {
-      await touchSession(sessionId, req.user.id);
+      void touchSession(sessionId, req.user.id).catch((error) => console.error("Session timestamp update failed:", error));
     }
 
     const ruleBasedSuggestion = suggestFollowUpStatus(statusRelevantFollowUps, message);
@@ -2980,6 +3115,10 @@ app.post("/chat", async (req, res) => {
   } catch (error) {
     console.error("Chat failed:", error);
     const cancelled = error?.name === "AbortError" || abortController.signal.aborted;
+    if (operation === "regenerate" && targetMessageId && (!cancelled || !streamedReply.trim())) {
+      const { error: restoreError } = await supabase.from("messages").update({ context_status: "active" }).eq("id", targetMessageId);
+      if (restoreError) console.error("Original reply restore failed:", restoreError);
+    }
     if (cancelled && trackedRequest?.session_id) {
       try {
         let partialMessage = null;

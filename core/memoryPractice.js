@@ -105,6 +105,7 @@ function buildExtractionPrompt(numberedTranscript, startedAt, endedAt) {
 function buildExperienceExtractionPrompt(numberedTranscript, startedAt, endedAt) {
   return [
     "Extract only grounded dated experiences from an AI-companion conversation. Return JSON only.",
+    "Write title, narrative_markdown, current_state, index_summary, and all search anchors in Simplified Chinese. Preserve proper names and exact quoted phrases in their original language.",
     "Return 0-3 experiences. Do not return knowledge_notes or handoff.",
     "Do not invent causes, feelings, decisions, or outcomes. Every factual claim must cite evidence_message_numbers.",
     "Each search_anchors object must contain arrays named people_places, event_names, key_objects, special_phrases, synonyms, final_state_terms.",
@@ -118,7 +119,9 @@ function buildExperienceExtractionPrompt(numberedTranscript, startedAt, endedAt)
 function buildSupportExtractionPrompt(numberedTranscript, startedAt, endedAt, documents = []) {
   return [
     "Extract only Knowledge File notes and window-handoff material from an AI-companion conversation. Return JSON only.",
+    "Write note_markdown and handoff fields in Simplified Chinese. Preserve proper names and exact quoted phrases in their original language.",
     "Do not return experiences. Create 0-4 concise knowledge notes. Do not rewrite a complete knowledge file.",
+    "A single explicit boundary, agreement, secret, major event, or direct correction MUST become a knowledge note when it clearly belongs in a durable Knowledge File. Ordinary scene details and temporary roleplay actions are not durable notes.",
     "Route each note to one existing target_document_id from the catalog when it clearly fits. Otherwise use null; never invent an ID.",
     "Every note and handoff must cite evidence_message_numbers. Do not invent feelings, decisions, or outcomes.",
     `Existing Knowledge File catalog: ${JSON.stringify(documents.map(({ id, name, document_type }) => ({ id, name, document_type })))}`,
@@ -126,6 +129,41 @@ function buildSupportExtractionPrompt(numberedTranscript, startedAt, endedAt, do
     `Segment time: ${startedAt} to ${endedAt}`,
     numberedTranscript,
   ].join("\n\n");
+}
+
+function buildImportDistillationPrompt({ experiences, documents }) {
+  return [
+    "Turn a group of grounded conversation experiences into conservative Knowledge File notes. Return JSON only.",
+    "Write all notes in Simplified Chinese. Preserve proper names and exact quoted phrases in their original language.",
+    "This is a collecting step, not a full-file rewrite. Return 0-8 concise notes that could later update an existing Markdown file.",
+    "Ordinary preferences or interaction patterns require support from at least 2 separate experiences. A single explicit agreement, secret, boundary, major event, or direct correction may be kept once.",
+    "Exclude temporary roleplay scenery, filler, duplicated wording, speculation, and inferred feelings or motives.",
+    "Each note must cite one or more evidence_experience_ids from the supplied material. Route it to an existing target_document_id when there is a clear match; otherwise use null. Never invent an ID.",
+    `Existing Knowledge File catalog: ${JSON.stringify(documents.map(({ id, name, document_type }) => ({ id, name, document_type })))}`,
+    'Schema: {"knowledge_notes":[{"target_document_id":null,"suggested_document_name":"","note_markdown":"","evidence_experience_ids":["E1"]}]}',
+    `Grounded experiences: ${JSON.stringify(experiences)}`,
+  ].join("\n\n");
+}
+
+function parseImportDistillation(raw, allowedExperienceIds, documentIds) {
+  const parsed = parseJsonObject(raw);
+  const allowed = new Set(allowedExperienceIds);
+  const allowedDocuments = new Set(documentIds);
+  return (Array.isArray(parsed.knowledge_notes) ? parsed.knowledge_notes : []).slice(0, 8).map((item) => {
+    const experienceIds = uniqueStrings(item.evidence_experience_ids, 20, 50);
+    if (!experienceIds.length || experienceIds.some((id) => !allowed.has(id))) {
+      throw new Error("Import distillation cited an unknown experience");
+    }
+    const suggestedDocumentName = String(item.suggested_document_name || "").trim().slice(0, 120);
+    const noteMarkdown = stripTransientCitations(item.note_markdown).slice(0, 6000);
+    if (!suggestedDocumentName || !noteMarkdown) throw new Error("An import-level knowledge note is incomplete");
+    return {
+      suggestedDocumentName,
+      noteMarkdown,
+      suggestedDocumentId: allowedDocuments.has(item.target_document_id) ? item.target_document_id : null,
+      experienceIds,
+    };
+  });
 }
 
 function parseMemoryVerification(raw, sourceMessages, allowedExperienceIds, documents) {
@@ -217,7 +255,8 @@ function buildVerificationPrompt({ numberedTranscript, experiences, knowledgeNot
 
 module.exports = {
   ANCHOR_FIELDS, buildExperienceExtractionPrompt, buildExtractionPrompt, buildSupportExtractionPrompt,
-  buildDocumentMergePrompt, buildVerificationPrompt, normalizeAnchors, parseDocumentMerge,
+  buildDocumentMergePrompt, buildImportDistillationPrompt, buildVerificationPrompt, normalizeAnchors, parseDocumentMerge,
+  parseImportDistillation,
   parseExperienceExtraction, parseMemoryExtraction, parseMemoryVerification, parseSupportExtraction,
   stripTransientCitations,
 };

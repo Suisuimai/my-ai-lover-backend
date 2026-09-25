@@ -2,7 +2,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   buildExperienceExtractionPrompt, buildExtractionPrompt, buildSupportExtractionPrompt,
-  buildDocumentMergePrompt, buildVerificationPrompt, parseDocumentMerge, parseMemoryExtraction,
+  buildDocumentMergePrompt, buildImportDistillationPrompt, buildVerificationPrompt, parseDocumentMerge,
+  parseImportDistillation, parseMemoryExtraction,
   parseMemoryVerification, stripTransientCitations,
 } = require("../core/memoryPractice");
 
@@ -45,6 +46,24 @@ test("split extraction prompts keep large outputs in separate JSON objects", () 
   assert.match(experiences, /Do not return knowledge_notes or handoff/);
   assert.match(support, /Do not return experiences/);
   assert.match(experiences, /0-3 experiences/);
+  assert.match(experiences, /Simplified Chinese/);
+  assert.match(support, /explicit boundary/);
+});
+
+test("distills grounded experiences into existing knowledge files", () => {
+  const prompt = buildImportDistillationPrompt({
+    experiences: [{ id: "e1", title: "边界", index_summary: "明确说不喜欢扯头发" }],
+    documents: [{ id: "d1", name: "亲密手册", document_type: "knowledge" }],
+  });
+  assert.match(prompt, /at least 2 separate experiences/);
+  const notes = parseImportDistillation(JSON.stringify({ knowledge_notes: [{
+    target_document_id: "d1", suggested_document_name: "亲密手册", note_markdown: "不接受扯头发。", evidence_experience_ids: ["e1"],
+  }] }), ["e1"], ["d1"]);
+  assert.equal(notes[0].suggestedDocumentId, "d1");
+  assert.deepEqual(notes[0].experienceIds, ["e1"]);
+  assert.throws(() => parseImportDistillation(JSON.stringify({ knowledge_notes: [{
+    target_document_id: "d1", suggested_document_name: "亲密手册", note_markdown: "无证据", evidence_experience_ids: ["e2"],
+  }] }), ["e1"], ["d1"]), /unknown experience/);
 });
 
 test("verification requires every experience and grounded knowledge patches", () => {
