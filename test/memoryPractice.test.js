@@ -58,12 +58,16 @@ test("distills grounded experiences into existing knowledge files", () => {
   assert.match(prompt, /at least 2 separate experiences/);
   const notes = parseImportDistillation(JSON.stringify({ knowledge_notes: [{
     target_document_id: "d1", suggested_document_name: "亲密手册", note_markdown: "不接受扯头发。", evidence_experience_ids: ["e1"],
-  }] }), ["e1"], ["d1"]);
+  }] }), ["e1"], [{ id: "d1", name: "亲密手册" }]);
   assert.equal(notes[0].suggestedDocumentId, "d1");
   assert.deepEqual(notes[0].experienceIds, ["e1"]);
   assert.throws(() => parseImportDistillation(JSON.stringify({ knowledge_notes: [{
     target_document_id: "d1", suggested_document_name: "亲密手册", note_markdown: "无证据", evidence_experience_ids: ["e2"],
-  }] }), ["e1"], ["d1"]), /unknown experience/);
+  }] }), ["e1"], [{ id: "d1", name: "亲密手册" }]), /unknown experience/);
+  const inferredName = parseImportDistillation(JSON.stringify({ knowledge_notes: [{
+    target_document_id: "d1", suggested_document_name: "", note_markdown: "明确边界。", evidence_experience_ids: ["e1"],
+  }] }), ["e1"], [{ id: "d1", name: "亲密手册" }]);
+  assert.equal(inferredName[0].suggestedDocumentName, "亲密手册");
 });
 
 test("verification requires every experience and grounded knowledge patches", () => {

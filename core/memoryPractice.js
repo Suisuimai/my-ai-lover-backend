@@ -145,22 +145,23 @@ function buildImportDistillationPrompt({ experiences, documents }) {
   ].join("\n\n");
 }
 
-function parseImportDistillation(raw, allowedExperienceIds, documentIds) {
+function parseImportDistillation(raw, allowedExperienceIds, documents) {
   const parsed = parseJsonObject(raw);
   const allowed = new Set(allowedExperienceIds);
-  const allowedDocuments = new Set(documentIds);
+  const documentMap = new Map(documents.map((document) => [document.id, document.name]));
   return (Array.isArray(parsed.knowledge_notes) ? parsed.knowledge_notes : []).slice(0, 8).map((item) => {
     const experienceIds = uniqueStrings(item.evidence_experience_ids, 20, 50);
     if (!experienceIds.length || experienceIds.some((id) => !allowed.has(id))) {
       throw new Error("Import distillation cited an unknown experience");
     }
-    const suggestedDocumentName = String(item.suggested_document_name || "").trim().slice(0, 120);
+    const targetDocumentId = documentMap.has(item.target_document_id) ? item.target_document_id : null;
+    const suggestedDocumentName = String(item.suggested_document_name || (targetDocumentId ? documentMap.get(targetDocumentId) : "")).trim().slice(0, 120);
     const noteMarkdown = stripTransientCitations(item.note_markdown).slice(0, 6000);
     if (!suggestedDocumentName || !noteMarkdown) throw new Error("An import-level knowledge note is incomplete");
     return {
       suggestedDocumentName,
       noteMarkdown,
-      suggestedDocumentId: allowedDocuments.has(item.target_document_id) ? item.target_document_id : null,
+      suggestedDocumentId: targetDocumentId,
       experienceIds,
     };
   });

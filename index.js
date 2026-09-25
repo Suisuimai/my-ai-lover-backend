@@ -2197,7 +2197,7 @@ app.post("/memory-practice/workspaces/:workspaceId/distill", async (req, res) =>
           { role: "user", content: buildImportDistillationPrompt({ experiences: material, documents: activeDocuments }) },
         ],
       });
-      generated.push(...parseImportDistillation(raw, group.map((item) => item.id), activeDocuments.map((document) => document.id)));
+      generated.push(...parseImportDistillation(raw, group.map((item) => item.id), activeDocuments));
     }
     const { error: deleteError } = await supabase.from("memory_knowledge_notes").delete()
       .in("batch_id", batchIds).eq("user_id", req.user.id).eq("source_kind", "import_distillation");
