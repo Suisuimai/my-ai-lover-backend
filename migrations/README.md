@@ -18,5 +18,5 @@ blindly: the security migration intentionally deletes legacy demo sessions.
 The first V2 migration will bind existing sessions to a default character
 without deleting messages or `session_memories`.
 
-Current latest migration: `014_session_handoff_binding.sql`, which lets a new
-conversation keep using the exact confirmed handoff selected when it was created.
+Current latest migration: `018_import_memory_distillation.sql`, which records
+whether an MD-ready note came from one segment or from whole-import distillation.

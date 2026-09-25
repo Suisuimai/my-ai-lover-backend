@@ -39,10 +39,12 @@ const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentC
 const {
   buildExperienceExtractionPrompt,
   buildDocumentMergePrompt,
+  buildImportDistillationPrompt,
   buildSupportExtractionPrompt,
   buildVerificationPrompt,
   parseExperienceExtraction,
   parseDocumentMerge,
+  parseImportDistillation,
   parseMemoryVerification,
   parseSupportExtraction,
 } = require("./core/memoryPractice");
@@ -2114,7 +2116,7 @@ app.get("/memory-practice/workspaces", async (req, res) => {
     const workspaceIds = (workspaces || []).map((workspace) => workspace.id);
     const characterIds = [...new Set((workspaces || []).map((workspace) => workspace.character_id))];
     const [{ data: batches, error: batchError }, { data: patches, error: patchError }, { data: documents, error: documentError }] = await Promise.all([
-      workspaceIds.length ? supabase.from("memory_processing_batches").select("id,workspace_id,segment_id").in("workspace_id", workspaceIds).eq("user_id", req.user.id) : { data: [], error: null },
+      workspaceIds.length ? supabase.from("memory_processing_batches").select("id,workspace_id,segment_id,memory_experience_candidates(id),memory_knowledge_notes(id,status,source_kind),memory_handoff_candidates(id)").in("workspace_id", workspaceIds).eq("user_id", req.user.id) : { data: [], error: null },
       workspaceIds.length ? supabase.from("memory_document_patch_candidates").select("*").in("workspace_id", workspaceIds).eq("user_id", req.user.id) : { data: [], error: null },
       characterIds.length ? supabase.from("prompt_documents").select("id,character_id,name,document_type,load_mode").in("character_id", characterIds).eq("user_id", req.user.id).neq("load_mode", "archive").order("sort_order") : { data: [], error: null },
     ]);
@@ -2134,6 +2136,15 @@ app.get("/memory-practice/workspaces", async (req, res) => {
           ...workspace,
           extractedSegmentCount: workspaceBatches.length,
           extractedSegmentIds: workspaceBatches.map((batch) => batch.segment_id),
+          experienceCount: workspaceBatches.reduce((sum, batch) => sum + (batch.memory_experience_candidates?.length || 0), 0),
+          extractedNoteCount: workspaceBatches.reduce((sum, batch) => sum + (batch.memory_knowledge_notes || []).filter((note) => note.status === "extracted").length, 0),
+          handoffCount: workspaceBatches.reduce((sum, batch) => sum + (batch.memory_handoff_candidates?.length || 0), 0),
+          segmentResults: workspaceBatches.map((batch) => ({
+            segmentId: batch.segment_id,
+            experienceCount: batch.memory_experience_candidates?.length || 0,
+            noteCount: (batch.memory_knowledge_notes || []).filter((note) => note.source_kind === "segment_extraction" && note.status === "extracted").length,
+            handoffCount: batch.memory_handoff_candidates?.length || 0,
+          })),
           notes: (notes || []).filter((note) => ids.has(note.batch_id)),
           patches: (patches || []).filter((patch) => patch.workspace_id === workspace.id),
         };
@@ -2141,6 +2152,80 @@ app.get("/memory-practice/workspaces", async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/memory-practice/workspaces/:workspaceId/distill", async (req, res) => {
+  try {
+    const { data: workspace, error } = await supabase.from("memory_import_workspaces").select("*")
+      .eq("id", req.params.workspaceId).eq("user_id", req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!workspace) return res.status(404).json({ success: false, error: "整份导入工作区不存在" });
+    const { data: batches, error: batchError } = await supabase.from("memory_processing_batches").select("id,segment_id")
+      .eq("workspace_id", workspace.id).eq("user_id", req.user.id);
+    if (batchError) throw batchError;
+    const batchIds = (batches || []).map((batch) => batch.id);
+    if (!batchIds.length) return res.status(400).json({ success: false, error: "请先提取至少一个片段" });
+    const [{ data: experiences, error: experienceError }, documents] = await Promise.all([
+      supabase.from("memory_experience_candidates").select("*").in("batch_id", batchIds).eq("user_id", req.user.id).order("created_at"),
+      loadPromptDocuments(req.user.id, workspace.character_id),
+    ]);
+    if (experienceError) throw experienceError;
+    if (!experiences?.length) return res.status(400).json({ success: false, error: "已提取片段中还没有经历素材" });
+    const activeDocuments = documents.filter((document) => document.load_mode !== "archive");
+    if (!activeDocuments.length) return res.status(400).json({ success: false, error: "请先创建至少一份可用的 Markdown 知识文件" });
+    const batchById = new Map((batches || []).map((batch) => [batch.id, batch]));
+    const experienceById = new Map(experiences.map((item) => [item.id, item]));
+    const settings = await getSettings(req.user.id);
+    const generated = [];
+    for (let offset = 0; offset < experiences.length; offset += 20) {
+      const group = experiences.slice(offset, offset + 20);
+      const material = group.map((item) => ({
+        id: item.id,
+        segment_id: batchById.get(item.batch_id)?.segment_id,
+        title: item.title,
+        index_summary: item.index_summary,
+        current_state: item.current_state,
+        search_anchors: item.search_anchors,
+        evidence: (item.evidence_refs || []).slice(0, 4).map((entry) => ({ role: entry.role, quote: String(entry.quote || "").slice(0, 600) })),
+      }));
+      const raw = await callModel({
+        purpose: "memory_verification", model: settings.summary_model, userId: req.user.id,
+        temperature: 0, maxTokens: 5000, responseFormat: "json_object", thinking: "disabled",
+        messages: [
+          { role: "system", content: "You conservatively distill grounded experiences into Chinese Knowledge File notes. Return complete JSON only." },
+          { role: "user", content: buildImportDistillationPrompt({ experiences: material, documents: activeDocuments }) },
+        ],
+      });
+      generated.push(...parseImportDistillation(raw, group.map((item) => item.id), activeDocuments.map((document) => document.id)));
+    }
+    const { error: deleteError } = await supabase.from("memory_knowledge_notes").delete()
+      .in("batch_id", batchIds).eq("user_id", req.user.id).eq("source_kind", "import_distillation");
+    if (deleteError) throw deleteError;
+    const rows = generated.map((item) => {
+      const sources = item.experienceIds.map((id) => experienceById.get(id)).filter(Boolean);
+      const evidence = sources.flatMap((source) => (source.evidence_refs || []).map((entry) => ({
+        ...entry,
+        experienceId: source.id,
+        experienceTitle: source.title,
+        segmentId: batchById.get(source.batch_id)?.segment_id,
+      }))).slice(0, 20);
+      return {
+        batch_id: sources[0].batch_id, user_id: req.user.id, character_id: workspace.character_id,
+        suggested_document_name: item.suggestedDocumentName, note_markdown: item.noteMarkdown,
+        target_document_id: item.suggestedDocumentId, evidence_refs: evidence,
+        source_kind: "import_distillation", source_experience_ids: item.experienceIds,
+      };
+    });
+    const { data: saved, error: saveError } = rows.length
+      ? await supabase.from("memory_knowledge_notes").insert(rows).select("*")
+      : { data: [], error: null };
+    if (saveError) throw saveError;
+    await supabase.from("memory_import_workspaces").update({ updated_at: new Date().toISOString() })
+      .eq("id", workspace.id).eq("user_id", req.user.id);
+    res.json({ success: true, notes: saved || [], experienceCount: experiences.length });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
