@@ -13,7 +13,7 @@ const {
   normalizeRecentMessageLimit,
 } = require("./core/context");
 const { prepareMessagesForProvider } = require("./core/promptCaching");
-const { calculateUsageCosts, normalizeOpenRouterPricing, shanghaiPeriodStarts } = require("./core/usageCosts");
+const { calculateUsageCosts, deepSeekPricingForEvent, normalizeOpenRouterPricing, shanghaiPeriodStarts } = require("./core/usageCosts");
 const {
   MEMORY_CATEGORIES,
   formatLongTermMemories,
@@ -274,7 +274,7 @@ async function readModelEventStream(response, { providerType, onDelta }) {
   return { text: text.trim(), data: finalData };
 }
 
-async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, signal }) {
+async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, signal, preparationMs = null }) {
   const startedAt = new Date();
   const startedClock = Date.now();
   let provider;
@@ -284,6 +284,7 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
   let errorCode = null;
   let resolvedModel = null;
   let providerRequestId = null;
+  let firstTokenMs = null;
 
   try {
     provider = await getModelTarget({ userId, purpose, legacyModel: model });
@@ -316,7 +317,10 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
       });
 
       if (onDelta && response.ok) {
-        const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta });
+        const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta: (delta, complete) => {
+          if (firstTokenMs === null) firstTokenMs = Math.max(0, (preparationMs || 0) + Date.now() - startedClock);
+          onDelta(delta, complete);
+        } });
         responseData = streamed.data;
         const text = streamed.text;
         if (!text) { errorCode = "empty_reply"; throw new Error(`${provider.name} returned an empty streamed reply`); }
@@ -373,7 +377,10 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
     });
 
     if (onDelta && response.ok) {
-      const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta });
+      const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta: (delta, complete) => {
+        if (firstTokenMs === null) firstTokenMs = Math.max(0, (preparationMs || 0) + Date.now() - startedClock);
+        onDelta(delta, complete);
+      } });
       responseData = streamed.data;
       const text = streamed.text;
       if (!text) { errorCode = "empty_reply"; throw new Error("Anthropic returned an empty streamed reply"); }
@@ -423,6 +430,8 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
         cost_currency: usage.costCurrency,
         cost_source: usage.costSource,
         duration_ms: Math.max(0, Date.now() - startedClock),
+        preparation_ms: Number.isFinite(preparationMs) ? Math.max(0, Math.trunc(preparationMs)) : null,
+        first_token_ms: firstTokenMs,
         provider_request_id: providerRequestId,
         started_at: startedAt.toISOString(),
         completed_at: new Date().toISOString(),
@@ -1780,6 +1789,46 @@ app.post("/sessions/:sessionId/messages", async (req, res) => {
   res.status(201).json({ success: true, message: data });
 });
 
+app.post("/messages/:messageId/select-variant", async (req, res) => {
+  try {
+    const { data: selected, error: selectedError } = await supabase.from("messages")
+      .select("id,session_id,role,created_at,replaces_message_id")
+      .eq("id", req.params.messageId).maybeSingle();
+    if (selectedError) throw selectedError;
+    if (!selected || selected.role !== "assistant") return res.status(404).json({ success: false, error: "Reply variant not found" });
+    await requireOwnedSession(selected.session_id, req.user.id);
+    const { data: assistants, error: assistantsError } = await supabase.from("messages")
+      .select("id,replaces_message_id,created_at").eq("session_id", selected.session_id)
+      .eq("role", "assistant").eq("is_visible", true).order("created_at", { ascending: true });
+    if (assistantsError) throw assistantsError;
+    const byId = new Map((assistants || []).map((message) => [message.id, message]));
+    const rootOf = (message) => {
+      let current = message;
+      const seen = new Set();
+      while (current?.replaces_message_id && byId.has(current.replaces_message_id) && !seen.has(current.id)) {
+        seen.add(current.id);
+        current = byId.get(current.replaces_message_id);
+      }
+      return current?.id;
+    };
+    const rootId = rootOf(selected);
+    const variantIds = (assistants || []).filter((message) => rootOf(message) === rootId).map((message) => message.id);
+    if (variantIds.length < 2) return res.status(400).json({ success: false, error: "This reply has no alternatives" });
+    const latestVariantTime = Math.max(...(assistants || []).filter((message) => variantIds.includes(message.id)).map((message) => new Date(message.created_at).getTime()));
+    const { data: laterUser } = await supabase.from("messages").select("id").eq("session_id", selected.session_id)
+      .eq("role", "user").eq("is_visible", true).eq("context_status", "active")
+      .gt("created_at", new Date(latestVariantTime).toISOString()).limit(1).maybeSingle();
+    if (laterUser) return res.status(409).json({ success: false, error: "继续聊天后不能再切换旧回复版本" });
+    const { error: demoteError } = await supabase.from("messages").update({ context_status: "alternative" }).in("id", variantIds);
+    if (demoteError) throw demoteError;
+    const { error: selectError } = await supabase.from("messages").update({ context_status: "active" }).eq("id", selected.id);
+    if (selectError) throw selectError;
+    res.json({ success: true, selectedMessageId: selected.id, variantIds });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
 // Read-only preview of the exact context layers used by companion chat.
 app.post("/prompt-preview", async (req, res) => {
   try {
@@ -2306,7 +2355,7 @@ app.get("/api-usage-events", async (req, res) => {
     const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? requestedLimit : 30));
     const periodStarts = shanghaiPeriodStarts();
     const { data, error } = await supabase.from("api_usage_events")
-      .select("id,purpose,provider,requested_model,resolved_model,status,input_tokens,output_tokens,total_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,provider_cost,cost_currency,cost_source,duration_ms,started_at")
+      .select("id,purpose,provider,requested_model,resolved_model,status,input_tokens,output_tokens,total_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,provider_cost,cost_currency,cost_source,duration_ms,preparation_ms,first_token_ms,started_at")
       .eq("user_id", req.user.id)
       .gte("started_at", periodStarts.month.toISOString())
       .order("started_at", { ascending: false })
@@ -2328,9 +2377,10 @@ app.get("/api-usage-events", async (req, res) => {
     }
     const pricedEvents = events.map((event) => {
       const modelId = event.resolved_model || event.requested_model;
-      const costs = calculateUsageCosts(event, event.provider === "openrouter"
+      const pricing = event.provider === "openrouter"
         ? openRouterPricingCache.prices.get(modelId)
-        : null);
+        : (event.provider === "deepseek" ? deepSeekPricingForEvent(event) : null);
+      const costs = calculateUsageCosts(event, pricing);
       return { event, costs };
     });
     const summarize = (items) => items.reduce((summary, item) => ({
@@ -2365,6 +2415,8 @@ app.get("/api-usage-events", async (req, res) => {
         costCurrency: event.cost_currency,
         costSource: costs.costSource,
         durationMs: event.duration_ms,
+        preparationMs: event.preparation_ms,
+        firstTokenMs: event.first_token_ms,
         startedAt: event.started_at,
       })),
     });
@@ -2666,6 +2718,7 @@ app.post("/chat-requests/:requestId/cancel", async (req, res) => {
 
 // Core chat: persist user message, assemble context, call model, and keep retries idempotent.
 app.post("/chat", async (req, res) => {
+  const requestStartedClock = Date.now();
   const message = typeof req.body.message === "string" ? req.body.message.trim() : "";
   if (!message) return res.status(400).json({ success: false, error: "A message is required" });
   const clientRequestId = req.body.clientRequestId;
@@ -2798,55 +2851,50 @@ app.post("/chat", async (req, res) => {
     }).eq("user_id", req.user.id);
     if (heartbeatResetError) console.error("Heartbeat timer reset failed:", heartbeatResetError.code || "database_error");
 
-    const settings = await getSettings(req.user.id);
-    const character = req.sessionRecord.character_id
-      ? await getOwnedCharacter(req.sessionRecord.character_id, req.user.id)
-      : await getOrCreateDefaultCharacter(req.user.id);
-    const userProfile = await getOrCreateUserProfile(req.user.id);
-    const promptDocuments = await loadPromptDocuments(req.user.id, character.id);
+    const [settings, character, userProfile] = await Promise.all([
+      getSettings(req.user.id),
+      req.sessionRecord.character_id
+        ? getOwnedCharacter(req.sessionRecord.character_id, req.user.id)
+        : getOrCreateDefaultCharacter(req.user.id),
+      getOrCreateUserProfile(req.user.id),
+    ]);
+    const loadMemorySummary = async () => {
+      try {
+        return await maybeCompressMemory(sessionId, settings, req.user.id);
+      } catch (compressionError) {
+        console.error("Memory compression failed:", compressionError);
+        const { data: existingMemory, error: memoryError } = await supabase.from("session_memories")
+          .select("summary").eq("session_id", sessionId).maybeSingle();
+        if (memoryError) throw memoryError;
+        return existingMemory?.summary;
+      }
+    };
+    const loadRecentHistory = async () => {
+      const { data, error } = await supabase.from("messages").select("role, content")
+        .eq("session_id", sessionId).eq("is_visible", true).eq("context_status", "active")
+        .order("created_at", { ascending: false })
+        .limit(normalizeRecentMessageLimit(settings.recent_message_limit));
+      if (error) throw error;
+      return data || [];
+    };
+    const [promptDocuments, continuity, relevantMemories, statusFollowUps, memorySummary, recentHistory] = await Promise.all([
+      loadPromptDocuments(req.user.id, character.id),
+      loadWindowContinuity(req.user.id, req.sessionRecord),
+      recallMemories(req.user.id, character.id, message).catch((error) => {
+        console.error("Long-term memory recall failed:", error);
+        return [];
+      }),
+      loadStatusFollowUps(req.user.id, character.id).catch((error) => {
+        console.error("Follow-up recall failed:", error);
+        return [];
+      }),
+      loadMemorySummary(),
+      loadRecentHistory(),
+    ]);
     const onDemandDocuments = selectRelevantPromptDocuments(promptDocuments, message, 3);
-    const continuity = await loadWindowContinuity(req.user.id, req.sessionRecord);
-    let relevantMemories = [];
-    try {
-      relevantMemories = await recallMemories(req.user.id, character.id, message);
-    } catch (recallError) {
-      console.error("Long-term memory recall failed:", recallError);
-    }
-    let statusFollowUps = [];
     let relevantFollowUps = [];
-    try {
-      statusFollowUps = await loadStatusFollowUps(req.user.id, character.id);
-      const conversationalFollowUps = statusFollowUps.filter((item) => ["active", "waiting"].includes(item.status));
-      relevantFollowUps = selectRelevantFollowUps(conversationalFollowUps, message, 3);
-    } catch (followUpError) {
-      console.error("Follow-up recall failed:", followUpError);
-    }
-    let memorySummary;
-    try {
-      memorySummary = await maybeCompressMemory(sessionId, settings, req.user.id);
-    } catch (compressionError) {
-      // A temporary compression failure must not prevent the companion from replying.
-      console.error("Memory compression failed:", compressionError);
-      const { data: existingMemory, error: memoryError } = await supabase
-        .from("session_memories")
-        .select("summary")
-        .eq("session_id", sessionId)
-        .maybeSingle();
-      if (memoryError) throw memoryError;
-      memorySummary = existingMemory?.summary;
-    }
-
-    const { data: recentHistory, error: historyError } = await supabase
-      .from("messages")
-      .select("role, content")
-      .eq("session_id", sessionId)
-      .eq("is_visible", true)
-      .eq("context_status", "active")
-      .order("created_at", { ascending: false })
-      .limit(normalizeRecentMessageLimit(settings.recent_message_limit));
-    if (historyError) throw historyError;
-
     const conversationalFollowUps = statusFollowUps.filter((item) => ["active", "waiting"].includes(item.status));
+    relevantFollowUps = selectRelevantFollowUps(conversationalFollowUps, message, 3);
     if (!relevantFollowUps.length) {
       relevantFollowUps = selectContextualFollowUps(conversationalFollowUps, message, recentHistory, 1);
     }
@@ -2871,6 +2919,7 @@ app.post("/chat", async (req, res) => {
     const requestedModel = typeof req.body.model === "string" && req.body.model.trim()
       ? req.body.model.trim()
       : settings.model;
+    const preparationMs = Math.max(0, Date.now() - requestStartedClock);
     const reply = await callModel({
         purpose: "companion_chat",
         model: requestedModel,
@@ -2880,6 +2929,7 @@ app.post("/chat", async (req, res) => {
         userId: req.user.id,
         sessionId,
         signal: abortController.signal,
+        preparationMs,
         onDelta: wantsStream ? (delta, complete) => {
           streamedReply = complete;
           sendStreamEvent("delta", { delta });
@@ -2902,14 +2952,14 @@ app.post("/chat", async (req, res) => {
 
     let title;
     if (isNewSession) {
-      title = await createTitle(requestedModel, message, reply, req.user.id);
-      const { error: titleError } = await supabase
-        .from("sessions")
-        .update({ name: title, updated_at: new Date().toISOString() })
-        .eq("id", sessionId);
-      if (titleError) console.error("Session title update failed:", titleError);
+      title = message.slice(0, 16) || DEFAULT_SESSION_NAME;
+      void createTitle(requestedModel, message, reply, req.user.id).then(async (generatedTitle) => {
+        const { error: titleError } = await supabase.from("sessions")
+          .update({ name: generatedTitle, updated_at: new Date().toISOString() }).eq("id", sessionId).eq("user_id", req.user.id);
+        if (titleError) console.error("Session title update failed:", titleError);
+      }).catch((error) => console.error("Background title generation failed:", error));
     } else {
-      await touchSession(sessionId, req.user.id);
+      void touchSession(sessionId, req.user.id).catch((error) => console.error("Session timestamp update failed:", error));
     }
 
     const ruleBasedSuggestion = suggestFollowUpStatus(statusRelevantFollowUps, message);
@@ -2980,6 +3030,10 @@ app.post("/chat", async (req, res) => {
   } catch (error) {
     console.error("Chat failed:", error);
     const cancelled = error?.name === "AbortError" || abortController.signal.aborted;
+    if (operation === "regenerate" && targetMessageId && (!cancelled || !streamedReply.trim())) {
+      const { error: restoreError } = await supabase.from("messages").update({ context_status: "active" }).eq("id", targetMessageId);
+      if (restoreError) console.error("Original reply restore failed:", restoreError);
+    }
     if (cancelled && trackedRequest?.session_id) {
       try {
         let partialMessage = null;

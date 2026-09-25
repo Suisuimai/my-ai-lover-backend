@@ -22,7 +22,7 @@ function normalizeModelUsage(providerName, data = {}) {
     outputTokens,
     totalTokens: reportedTotal || inputTokens + outputTokens,
     cacheReadTokens: nonNegativeInteger(
-      promptDetails.cached_tokens ?? usage.cached_tokens ?? usage.cache_read_input_tokens,
+      promptDetails.cached_tokens ?? usage.cached_tokens ?? usage.cache_read_input_tokens ?? usage.prompt_cache_hit_tokens,
     ),
     cacheWriteTokens: nonNegativeInteger(
       promptDetails.cache_write_tokens ?? usage.cache_write_tokens ?? usage.cache_creation_input_tokens,
