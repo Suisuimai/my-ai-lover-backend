@@ -2001,7 +2001,7 @@ app.post("/memory-practice/segments/:segmentId/extract", async (req, res) => {
       getOrCreateUserProfile(req.user.id),
     ]);
     const documents = allDocuments.filter((document) => document.load_mode !== "archive");
-    const identities = { characterName: character.name || "季疏", userName: userProfile.display_name || "好好" };
+    const identities = { characterName: character.name || "季疏", userName: userProfile.display_name || "年妤", userAliases: ["妤妤"] };
     const sourceMessages = (segment.raw_messages || []).map((message) => ({
       role: message.role,
       content: cleanClaudeSay(message.role, message.content),
@@ -2181,7 +2181,7 @@ app.post("/memory-practice/workspaces/:workspaceId/distill", async (req, res) =>
     if (experienceError) throw experienceError;
     if (!experiences?.length) return res.status(400).json({ success: false, error: "已提取片段中还没有经历素材" });
     const activeDocuments = documents.filter((document) => document.load_mode !== "archive");
-    const identities = { characterName: character.name || "季疏", userName: userProfile.display_name || "好好" };
+    const identities = { characterName: character.name || "季疏", userName: userProfile.display_name || "年妤", userAliases: ["妤妤"] };
     if (!activeDocuments.length) return res.status(400).json({ success: false, error: "请先创建至少一份可用的 Markdown 知识文件" });
     const batchById = new Map((batches || []).map((batch) => [batch.id, batch]));
     const experienceById = new Map(experiences.map((item) => [item.id, item]));

@@ -54,10 +54,11 @@ test("distills grounded experiences into existing knowledge files", () => {
   const prompt = buildImportDistillationPrompt({
     experiences: [{ id: "e1", title: "边界", index_summary: "明确说不喜欢扯头发" }],
     documents: [{ id: "d1", name: "亲密手册", document_type: "knowledge" }],
-    identities: { characterName: "季疏", userName: "好好" },
+    identities: { characterName: "季疏", userName: "年妤", userAliases: ["妤妤"] },
   });
   assert.match(prompt, /at least 2 separate experiences/);
   assert.match(prompt, /Companion is 季疏/);
+  assert.match(prompt, /User is 年妤 \(also called 妤妤\)/);
   const notes = parseImportDistillation(JSON.stringify({ knowledge_notes: [{
     target_document_id: "d1", suggested_document_name: "亲密手册", note_markdown: "不接受扯头发。", evidence_experience_ids: ["e1"],
   }] }), ["e1"], [{ id: "d1", name: "亲密手册" }]);
@@ -68,9 +69,9 @@ test("distills grounded experiences into existing knowledge files", () => {
   }] }), ["e1"], [{ id: "d1", name: "亲密手册" }]), /unknown experience/);
   const inferredName = parseImportDistillation(JSON.stringify({ knowledge_notes: [{
     target_document_id: "d1", suggested_document_name: "", note_markdown: "Companion明确边界，User表示理解。", evidence_experience_ids: ["e1"],
-  }] }), ["e1"], [{ id: "d1", name: "亲密手册" }], { characterName: "季疏", userName: "好好" });
+  }] }), ["e1"], [{ id: "d1", name: "亲密手册" }], { characterName: "季疏", userName: "年妤", userAliases: ["妤妤"] });
   assert.equal(inferredName[0].suggestedDocumentName, "亲密手册");
-  assert.equal(inferredName[0].noteMarkdown, "季疏明确边界，好好表示理解。");
+  assert.equal(inferredName[0].noteMarkdown, "季疏明确边界，年妤表示理解。");
 });
 
 test("verification requires every experience and grounded knowledge patches", () => {
