@@ -19,8 +19,8 @@ function normalizeClaudeExport(payload) {
   return payload.messages.map((message, index) => {
     const role = message.role === "human" ? "user" : message.role === "assistant" ? "assistant" : null;
     const occurredAt = parseClaudeTime(message.time);
-    const raw = String(message.say || "").trim();
-    if (!role || !occurredAt || !raw) throw new Error(`Invalid Claude message at position ${index + 1}`);
+    const raw = String(message.say || "");
+    if (!role || !occurredAt || !raw.trim()) throw new Error(`Invalid Claude message at position ${index + 1}`);
     return { role, occurredAt, raw, cleaned: cleanClaudeSay(message.role, raw) };
   });
 }
@@ -44,7 +44,7 @@ function segmentClaudeMessages(messages, gapMinutes = 30, maxChars = MAX_SEGMENT
     endedAt: items.at(-1).occurredAt.toISOString(),
     messageCount: items.length,
     charCount: items.reduce((total, item) => total + item.cleaned.length, 0),
-    rawMessages: items.map(({ role, occurredAt, raw }) => ({ role, time: occurredAt.toISOString(), content: raw })),
+    rawMessages: items.map(({ sourceMessageId, sourcePosition, role, occurredAt, raw }) => ({ source_message_id: sourceMessageId || null, source_position: sourcePosition || null, role, time: occurredAt.toISOString(), content: raw })),
     transcript: items.map((item) => `${item.role === "user" ? "User" : "Companion"}: ${item.cleaned}`).join("\n\n"),
   }));
 }

@@ -1037,7 +1037,9 @@ app.post("/timeline-imports", async (req, res) => {
   let createdImport;
   try {
     const character = req.body.characterId ? await getOwnedCharacter(req.body.characterId, req.user.id) : await getOrCreateDefaultCharacter(req.user.id);
-    const messages = normalizeClaudeExport(req.body.exportData);
+    const messages = normalizeClaudeExport(req.body.exportData).map((message, index) => ({
+      ...message, sourceMessageId: crypto.randomUUID(), sourcePosition: index + 1,
+    }));
     if (messages.length > 10000) return res.status(400).json({ success: false, error: "An export can contain at most 10,000 messages" });
     const segments = segmentClaudeMessages(messages);
     const title = String(req.body.exportData?.metadata?.title || req.body.sourceFilename || "Claude import").slice(0, 160);
@@ -1056,6 +1058,25 @@ app.post("/timeline-imports", async (req, res) => {
     }));
     const { data: savedSegments, error: segmentError } = await supabase.from("imported_conversation_segments").insert(rows).select("id,sequence,started_at,ended_at,message_count,character_count,status");
     if (segmentError) throw segmentError;
+    const segmentIds = new Map(savedSegments.map((segment) => [segment.sequence, segment.id]));
+    const sourceRows = rows.flatMap((segment) => segment.raw_messages.map((source, index) => ({
+      id: source.source_message_id,
+      user_id: req.user.id,
+      character_id: character.id,
+      source_kind: "claude_import",
+      revision_kind: "original",
+      role: source.role,
+      raw_content: source.content,
+      occurred_at: source.time,
+      import_id: data.id,
+      imported_segment_id: segmentIds.get(segment.sequence),
+      revision_number: 0,
+      source_position: source.source_position,
+      segment_message_index: index + 1,
+      source_metadata: { source_filename: String(req.body.sourceFilename || "claude-export.json").slice(0, 255), segment_sequence: segment.sequence },
+    })));
+    const { error: sourceError } = await supabase.from("source_messages").insert(sourceRows);
+    if (sourceError) throw sourceError;
     res.status(201).json({ success: true, import: data, segments: savedSegments });
   } catch (error) {
     if (createdImport?.id) await supabase.from("conversation_imports").delete().eq("id", createdImport.id).eq("user_id", req.user.id);
@@ -1789,6 +1810,22 @@ app.post("/sessions/:sessionId/messages", async (req, res) => {
   }
 
   res.status(201).json({ success: true, message: data });
+});
+
+app.get("/source-messages", async (req, res) => {
+  try {
+    const sessionId = validUuid(req.query.sessionId) ? req.query.sessionId : null;
+    const importId = validUuid(req.query.importId) ? req.query.importId : null;
+    if (!sessionId && !importId) return res.status(400).json({ success: false, error: "A valid sessionId or importId is required" });
+    let query = supabase.from("source_messages").select("id,character_id,source_kind,revision_kind,role,raw_content,occurred_at,session_id,import_id,imported_segment_id,operational_message_id,supersedes_source_message_id,revision_number,source_position,segment_message_index,source_metadata,created_at")
+      .eq("user_id", req.user.id).order("occurred_at").order("created_at").limit(1000);
+    query = sessionId ? query.eq("session_id", sessionId) : query.eq("import_id", importId);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ success: true, messages: data || [] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 app.post("/messages/:messageId/select-variant", async (req, res) => {
@@ -2813,8 +2850,8 @@ app.post("/chat-requests/:requestId/cancel", async (req, res) => {
 // Core chat: persist user message, assemble context, call model, and keep retries idempotent.
 app.post("/chat", async (req, res) => {
   const requestStartedClock = Date.now();
-  const message = typeof req.body.message === "string" ? req.body.message.trim() : "";
-  if (!message) return res.status(400).json({ success: false, error: "A message is required" });
+  const message = typeof req.body.message === "string" ? req.body.message : "";
+  if (!message.trim()) return res.status(400).json({ success: false, error: "A message is required" });
   const clientRequestId = req.body.clientRequestId;
   if (!validUuid(clientRequestId)) return res.status(400).json({ success: false, error: "A valid clientRequestId is required" });
 

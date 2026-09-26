@@ -18,5 +18,5 @@ blindly: the security migration intentionally deletes legacy demo sessions.
 The first V2 migration will bind existing sessions to a default character
 without deleting messages or `session_memories`.
 
-Current latest migration: `018_import_memory_distillation.sql`, which records
-whether an MD-ready note came from one segment or from whole-import distillation.
+Current latest migration: `019_immutable_source_ledger.sql`, which gives every
+live or imported raw message a permanent ID and records edits as appended revisions.
