@@ -1966,7 +1966,7 @@ function startDiaryJob(jobId) {
   setImmediate(() => processDiaryGenerationJob(jobId).catch((error) => console.error("Diary job crashed:", error)));
 }
 
-async function createDiaryJobForLatestVersion({ userId, characterId, sharedDayId }) {
+async function createDiaryJobForLatestVersion({ userId, characterId, sharedDayId, retry = false }) {
   const { data: day, error: dayError } = await supabase.from("shared_life_days").select("*")
     .eq("id", sharedDayId).eq("user_id", userId).eq("character_id", characterId).maybeSingle();
   if (dayError) throw dayError;
@@ -1977,9 +1977,11 @@ async function createDiaryJobForLatestVersion({ userId, characterId, sharedDayId
   if (!version || version.boundary_state !== "sealed") { const error = new Error("This shared day has not ended yet"); error.status = 409; throw error; }
   const { data: existing, error: existingError } = await supabase.from("diary_generation_jobs").select("*")
     .eq("shared_day_version_id", version.id).eq("user_id", userId)
-    .in("status", ["queued", "running", "succeeded"]).order("created_at", { ascending: false }).limit(1).maybeSingle();
+    .order("created_at", { ascending: false }).limit(1).maybeSingle();
   if (existingError) throw existingError;
-  if (existing) return { job: existing, created: false };
+  if (existing && (!retry || ["queued", "running", "succeeded"].includes(existing.status))) {
+    return { job: existing, created: false };
+  }
   const { count, error: countError } = await supabase.from("diary_generation_jobs").select("id", { count: "exact", head: true })
     .eq("shared_day_version_id", version.id).eq("user_id", userId);
   if (countError) throw countError;
@@ -1998,6 +2000,7 @@ app.post("/diary/shared-days/:sharedDayId/generate", async (req, res) => {
       : await getOrCreateDefaultCharacter(req.user.id);
     const result = await createDiaryJobForLatestVersion({
       userId: req.user.id, characterId: character.id, sharedDayId: req.params.sharedDayId,
+      retry: req.body.retry === true,
     });
     if (result.created) startDiaryJob(result.job.id);
     res.status(result.created ? 202 : 200).json({ success: true, created: result.created, job: result.job });
@@ -2016,6 +2019,38 @@ app.get("/diary/entries", async (req, res) => {
       .order("created_at", { ascending: false }).limit(120);
     if (error) throw error;
     res.json({ success: true, entries: data || [] });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/diary/entries/:entryId/sources", async (req, res) => {
+  try {
+    const { data: entry, error: entryError } = await supabase.from("diary_entries")
+      .select("id,character_id,source_message_ids").eq("id", req.params.entryId).eq("user_id", req.user.id).maybeSingle();
+    if (entryError) throw entryError;
+    if (!entry) return res.status(404).json({ success: false, error: "Diary entry not found" });
+    const byId = new Map((await readAllOwnedSourceMessages(req.user.id, entry.character_id)).map((message) => [message.id, message]));
+    const messages = entry.source_message_ids.map((id) => byId.get(id)).filter(Boolean).map((message) => ({
+      id: message.id, role: message.role, content: message.raw_content,
+      occurredAt: message.source_metadata?.original_message_created_at || message.occurred_at,
+    }));
+    res.json({ success: true, messages, partial: messages.length !== entry.source_message_ids.length });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/diary/jobs", async (req, res) => {
+  try {
+    const character = req.query.characterId
+      ? await getOwnedCharacter(req.query.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const { data, error } = await supabase.from("diary_generation_jobs").select("*")
+      .eq("user_id", req.user.id).eq("character_id", character.id)
+      .order("created_at", { ascending: false }).limit(120);
+    if (error) throw error;
+    res.json({ success: true, jobs: data || [] });
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });
   }
