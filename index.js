@@ -1788,30 +1788,6 @@ async function sendMessages(req, res) {
 app.get("/sessions/:sessionId/messages", sendMessages);
 app.get("/messages/:sessionId", sendMessages);
 
-app.post("/sessions/:sessionId/messages", async (req, res) => {
-  const { role, content } = req.body;
-  if (!["user", "assistant"].includes(role) || typeof content !== "string" || !content.trim()) {
-    return res.status(400).json({ success: false, error: "role and content are required" });
-  }
-
-  try { await requireOwnedSession(req.params.sessionId, req.user.id); } catch (error) { return res.status(error.status || 500).json({ error: error.message }); }
-  const { data, error } = await supabase
-    .from("messages")
-    .insert({ session_id: req.params.sessionId, role, content: content.trim(), is_visible: true })
-    .select()
-    .single();
-
-  if (error) return res.status(500).json({ success: false, error: error.message });
-
-  try {
-    await touchSession(req.params.sessionId, req.user.id);
-  } catch (touchError) {
-    console.error("Session timestamp update failed:", touchError);
-  }
-
-  res.status(201).json({ success: true, message: data });
-});
-
 app.get("/source-messages", async (req, res) => {
   try {
     const sessionId = validUuid(req.query.sessionId) ? req.query.sessionId : null;

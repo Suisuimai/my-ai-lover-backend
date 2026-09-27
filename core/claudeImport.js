@@ -11,7 +11,7 @@ function parseClaudeTime(value) {
 function cleanClaudeSay(role, say) {
   const text = String(say || "").trim();
   if (role !== "assistant") return text;
-  return text.replace(/^[\s\S]*?\n\s*Done\s*\n+/i, "").trim();
+  return text.replace(/^analysis\s*\r?\n[\s\S]*?\r?\n\s*Done\s*(?:\r?\n)+/i, "").trim();
 }
 
 function normalizeClaudeExport(payload) {
