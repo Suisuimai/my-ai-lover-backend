@@ -36,6 +36,7 @@ const {
 const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } = require("./core/timeline");
 const { buildHandoffPrompt, formatWindowContinuity, parseHandoffCandidate } = require("./core/handoff");
 const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
+const { groupSourceMessagesBySharedDay } = require("./core/sharedDays");
 const {
   buildExperienceExtractionPrompt,
   buildDocumentMergePrompt,
@@ -1801,6 +1802,98 @@ app.get("/source-messages", async (req, res) => {
     res.json({ success: true, messages: data || [] });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+async function readAllOwnedSourceMessages(userId, characterId) {
+  const messages = [];
+  const pageSize = 1000;
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await supabase.from("source_messages")
+      .select("id,source_kind,revision_kind,raw_content,occurred_at,operational_message_id,revision_number,source_metadata")
+      .eq("user_id", userId).eq("character_id", characterId)
+      .order("occurred_at").order("created_at").range(from, from + pageSize - 1);
+    if (error) throw error;
+    messages.push(...(data || []));
+    if (!data || data.length < pageSize) break;
+  }
+  return messages;
+}
+
+async function latestSharedDayVersions(dayIds, userId) {
+  if (!dayIds.length) return new Map();
+  const { data, error } = await supabase.from("shared_life_day_versions").select("*")
+    .eq("user_id", userId).in("shared_day_id", dayIds)
+    .order("revision_number", { ascending: false });
+  if (error) throw error;
+  const latest = new Map();
+  for (const version of data || []) if (!latest.has(version.shared_day_id)) latest.set(version.shared_day_id, version);
+  return latest;
+}
+
+app.get("/diary/shared-days", async (req, res) => {
+  try {
+    const character = req.query.characterId
+      ? await getOwnedCharacter(req.query.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const { data: days, error } = await supabase.from("shared_life_days").select("*")
+      .eq("user_id", req.user.id).eq("character_id", character.id)
+      .order("day_key", { ascending: false }).limit(120);
+    if (error) throw error;
+    const versions = await latestSharedDayVersions((days || []).map((day) => day.id), req.user.id);
+    res.json({ success: true, days: (days || []).map((day) => ({ ...day, latestVersion: versions.get(day.id) || null })) });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/diary/shared-days/rebuild", async (req, res) => {
+  try {
+    const character = req.body.characterId
+      ? await getOwnedCharacter(req.body.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const grouped = groupSourceMessagesBySharedDay(await readAllOwnedSourceMessages(req.user.id, character.id));
+    let appendedVersions = 0;
+    for (const group of grouped) {
+      let { data: day, error: dayError } = await supabase.from("shared_life_days").select("*")
+        .eq("user_id", req.user.id).eq("character_id", character.id).eq("day_key", group.dayKey).maybeSingle();
+      if (dayError) throw dayError;
+      if (!day) {
+        const inserted = await supabase.from("shared_life_days").insert({
+          user_id: req.user.id, character_id: character.id, day_key: group.dayKey,
+        }).select().single();
+        if (inserted.error) throw inserted.error;
+        day = inserted.data;
+      }
+      const { data: previous, error: previousError } = await supabase.from("shared_life_day_versions").select("*")
+        .eq("shared_day_id", day.id).eq("user_id", req.user.id)
+        .order("revision_number", { ascending: false }).limit(1).maybeSingle();
+      if (previousError) throw previousError;
+      const unchanged = previous
+        && JSON.stringify(previous.source_message_ids) === JSON.stringify(group.sourceMessageIds)
+        && previous.boundary_state === group.boundaryState
+        && previous.boundary_reason === group.boundaryReason
+        && previous.morning_marker_source_id === group.morningMarkerSourceId
+        && previous.night_marker_source_id === group.nightMarkerSourceId;
+      if (unchanged) continue;
+      const { error: versionError } = await supabase.from("shared_life_day_versions").insert({
+        shared_day_id: day.id, user_id: req.user.id, character_id: character.id,
+        revision_number: previous ? previous.revision_number + 1 : 0,
+        started_at: group.startedAt, ended_at: group.endedAt,
+        source_message_ids: group.sourceMessageIds,
+        first_source_message_id: group.firstSourceMessageId,
+        last_source_message_id: group.lastSourceMessageId,
+        morning_marker_source_id: group.morningMarkerSourceId,
+        night_marker_source_id: group.nightMarkerSourceId,
+        boundary_state: group.boundaryState, boundary_reason: group.boundaryReason,
+        supersedes_version_id: previous?.id || null,
+      });
+      if (versionError) throw versionError;
+      appendedVersions += 1;
+    }
+    res.json({ success: true, discoveredDays: grouped.length, appendedVersions });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
