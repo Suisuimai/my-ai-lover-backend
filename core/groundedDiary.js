@@ -74,7 +74,43 @@ function documentaryTokens(value) {
   return [...new Set([...numeric, ...temporal, ...quoted])];
 }
 
-function validateGroundedDiary(diary, sourceMessages) {
+const chineseHours = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十", "二十一", "二十二", "二十三"];
+
+function timestampEvidence(message) {
+  const raw = message.effective_occurred_at || message.occurred_at;
+  const date = new Date(raw);
+  if (!raw || Number.isNaN(date.getTime())) return "";
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+  const hour = Number(parts.hour);
+  const minute = Number(parts.minute);
+  const aliases = [
+    `${parts.year}-${parts.month}-${parts.day}`,
+    `${Number(parts.month)}月${Number(parts.day)}日`,
+    `${Number(parts.month)}月${Number(parts.day)}号`,
+    `${hour}:${String(minute).padStart(2, "0")}`,
+    `${hour}点`, `${chineseHours[hour]}点`,
+  ];
+  if (hour === 0) aliases.push("零点", "凌晨");
+  else if (hour < 6) aliases.push("凌晨");
+  else if (hour < 9) aliases.push("早上");
+  else if (hour < 12) aliases.push("上午");
+  else if (hour < 14) aliases.push("中午");
+  else if (hour < 18) aliases.push("下午");
+  else aliases.push("晚上");
+  return aliases.join(" ");
+}
+
+function evidenceText(messages, dayKey = "") {
+  return [
+    ...messages.flatMap((message) => [String(message.raw_content || ""), timestampEvidence(message)]),
+    dayKey ? `${dayKey} 今天` : "",
+  ].filter(Boolean).join("\n");
+}
+
+function validateGroundedDiary(diary, sourceMessages, { dayKey = "" } = {}) {
   const issues = [];
   const validFacts = [];
   const validFeelings = [];
@@ -82,7 +118,7 @@ function validateGroundedDiary(diary, sourceMessages) {
 
   diary.facts.forEach((fact, index) => {
     const cited = citedSources(fact.evidenceNumbers);
-    const citedText = cited.map((message) => String(message.raw_content || "")).join("\n");
+    const citedText = evidenceText(cited, dayKey);
     const factIssues = [];
     if (!cited.length) factIssues.push("没有有效的原始消息编号");
     if (!fact.evidenceQuotes.length) factIssues.push("没有逐字证据");
@@ -108,7 +144,7 @@ function validateGroundedDiary(diary, sourceMessages) {
     issues.push({ kind: "empty", itemIndex: null, text: "", reasons: ["日记没有可回源的事实或感受"] });
   }
 
-  const wholeSource = sourceMessages.map((message) => String(message.raw_content || "")).join("\n");
+  const wholeSource = evidenceText(sourceMessages, dayKey);
   const missingBodyTokens = documentaryTokens(diary.bodyMarkdown).filter((token) => !wholeSource.includes(token));
   if (missingBodyTokens.length) {
     issues.push({

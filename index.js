@@ -1959,14 +1959,14 @@ async function processDiaryGenerationJob(jobId) {
     const settings = await getSettings(job.user_id);
     const raw = await callModel({
       purpose: "diary_generation", model: settings.summary_model, userId: job.user_id,
-      sessionId: job.shared_day_id, temperature: 0.2, maxTokens: 4000, responseFormat: "json_object", thinking: "disabled",
+      sessionId: job.shared_day_id, temperature: 0.2, maxTokens: 7000, responseFormat: "json_object", thinking: "disabled",
       messages: [
         { role: "system", content: "你只根据给定原始消息写有证据的第一人称中文日记，并严格返回指定 JSON。" },
         { role: "user", content: buildGroundedDiaryPrompt({ dayKey: day.day_key, messages: sourceMessages }) },
       ],
     });
     const diary = parseGroundedDiary(raw, sourceMessages);
-    const validation = validateGroundedDiary(diary, sourceMessages);
+    const validation = validateGroundedDiary(diary, sourceMessages, { dayKey: day.day_key });
     const status = validation.issues.length ? "needs_review" : "confirmed";
     const entryId = crypto.randomUUID();
     const { error: saveError } = await supabase.rpc("save_grounded_diary", {
@@ -1991,10 +1991,20 @@ async function processDiaryGenerationJob(jobId) {
     const completedAt = new Date().toISOString();
     await supabase.from("diary_generation_jobs").update({
       status: "failed", completed_at: completedAt, updated_at: completedAt,
-      error_code: String(error?.code || "diary_generation_failed").slice(0, 120),
+      error_code: classifyDiaryGenerationError(error),
     }).eq("id", job.id);
     console.error("Diary generation failed:", error);
   }
+}
+
+function classifyDiaryGenerationError(error) {
+  if (error?.code) return String(error.code).slice(0, 120);
+  const message = String(error?.message || "").toLowerCase();
+  if (message.includes("empty reply") || message.includes("empty response")) return "empty_reply";
+  if (message.includes("finish_reason: length") || message.includes("maximum context") || message.includes("max_tokens")) return "output_length";
+  if (message.includes("json") || message.includes("diary model") || message.includes("omitted its title")) return "invalid_json";
+  if (message.includes("source message is missing")) return "source_message_missing";
+  return "diary_generation_failed";
 }
 
 function startDiaryJob(jobId) {
