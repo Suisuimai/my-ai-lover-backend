@@ -7,6 +7,7 @@ const FEATURE_DEFINITIONS = [
   { id: "companion_chat", name: "伴侣聊天", description: "生成每次正式回复" },
   { id: "long_term_memory_extraction", name: "记忆提取", description: "批量读取对话，提取事件、证据与候选文档", recommendation: "建议使用便宜模型" },
   { id: "memory_verification", name: "记忆校验与合并", description: "检查失真并合并 Knowledge File", recommendation: "建议使用较强模型" },
+  { id: "diary_generation", name: "共同生活日记", description: "一天结束后异步生成有原文证据的日记", recommendation: "建议使用便宜模型", follows: "long_term_memory_extraction" },
   { id: "timeline_generation", name: "候选日记", description: "整理导入的 Claude 对话" },
   { id: "conversation_title", name: "窗口标题", description: "默认跟随伴侣聊天", follows: "companion_chat" },
   { id: "conversation_summary", name: "窗口摘要", description: "默认跟随记忆提取", follows: "long_term_memory_extraction" },

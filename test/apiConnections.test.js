@@ -30,6 +30,7 @@ test("keeps feature registration centralized and includes separate memory jobs",
   assert.deepEqual(new Set(FEATURE_DEFINITIONS.map((feature) => feature.id)), FEATURE_PURPOSES);
   assert.equal(FEATURE_PURPOSES.has("long_term_memory_extraction"), true);
   assert.equal(FEATURE_PURPOSES.has("memory_verification"), true);
+  assert.equal(FEATURE_PURPOSES.has("diary_generation"), true);
 });
 
 test("recognizes gateway capabilities from a connection without exposing providers as cards", () => {

@@ -37,6 +37,7 @@ const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } 
 const { buildHandoffPrompt, formatWindowContinuity, parseHandoffCandidate } = require("./core/handoff");
 const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
 const { groupSourceMessagesBySharedDay } = require("./core/sharedDays");
+const { buildGroundedDiaryPrompt, parseGroundedDiary, validateGroundedDiary } = require("./core/groundedDiary");
 const {
   buildExperienceExtractionPrompt,
   buildDocumentMergePrompt,
@@ -1810,7 +1811,7 @@ async function readAllOwnedSourceMessages(userId, characterId) {
   const pageSize = 1000;
   for (let from = 0; ; from += pageSize) {
     const { data, error } = await supabase.from("source_messages")
-      .select("id,source_kind,revision_kind,raw_content,occurred_at,operational_message_id,revision_number,source_metadata")
+      .select("id,source_kind,revision_kind,role,raw_content,occurred_at,operational_message_id,revision_number,source_metadata")
       .eq("user_id", userId).eq("character_id", characterId)
       .order("occurred_at").order("created_at").range(from, from + pageSize - 1);
     if (error) throw error;
@@ -1895,6 +1896,137 @@ app.post("/diary/shared-days/rebuild", async (req, res) => {
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });
   }
+});
+
+async function processDiaryGenerationJob(jobId) {
+  const { data: job, error: jobError } = await supabase.from("diary_generation_jobs").select("*")
+    .eq("id", jobId).maybeSingle();
+  if (jobError) throw jobError;
+  if (!job || job.status !== "queued") return;
+  const startedAt = new Date().toISOString();
+  const { error: runningError } = await supabase.from("diary_generation_jobs").update({
+    status: "running", started_at: startedAt, updated_at: startedAt, error_code: null,
+  }).eq("id", job.id).eq("status", "queued");
+  if (runningError) throw runningError;
+  try {
+    const [{ data: day, error: dayError }, { data: version, error: versionError }] = await Promise.all([
+      supabase.from("shared_life_days").select("*").eq("id", job.shared_day_id).eq("user_id", job.user_id).maybeSingle(),
+      supabase.from("shared_life_day_versions").select("*").eq("id", job.shared_day_version_id).eq("user_id", job.user_id).maybeSingle(),
+    ]);
+    if (dayError || versionError) throw dayError || versionError;
+    if (!day || !version || version.boundary_state !== "sealed") throw new Error("Only a sealed shared day can become a diary");
+    const sourceById = new Map((await readAllOwnedSourceMessages(job.user_id, job.character_id)).map((message) => [message.id, message]));
+    const sourceMessages = version.source_message_ids.map((id) => sourceById.get(id)).filter(Boolean).map((message) => ({
+      ...message,
+      effective_occurred_at: message.source_metadata?.original_message_created_at || message.occurred_at,
+    }));
+    if (sourceMessages.length !== version.source_message_ids.length) throw new Error("A diary source message is missing");
+    const settings = await getSettings(job.user_id);
+    const raw = await callModel({
+      purpose: "diary_generation", model: settings.summary_model, userId: job.user_id,
+      sessionId: job.shared_day_id, temperature: 0.2, maxTokens: 4000, responseFormat: "json_object", thinking: "disabled",
+      messages: [
+        { role: "system", content: "你只根据给定原始消息写有证据的第一人称中文日记，并严格返回指定 JSON。" },
+        { role: "user", content: buildGroundedDiaryPrompt({ dayKey: day.day_key, messages: sourceMessages }) },
+      ],
+    });
+    const diary = parseGroundedDiary(raw, sourceMessages);
+    const validation = validateGroundedDiary(diary, sourceMessages);
+    const status = validation.issues.length ? "needs_review" : "confirmed";
+    const entryId = crypto.randomUUID();
+    const { error: saveError } = await supabase.rpc("save_grounded_diary", {
+      p_entry_id: entryId, p_user_id: job.user_id, p_character_id: job.character_id,
+      p_shared_day_id: day.id, p_shared_day_version_id: version.id, p_generation_job_id: job.id,
+      p_status: status, p_title: diary.title, p_body_markdown: diary.bodyMarkdown,
+      p_current_state: diary.currentState, p_source_message_ids: version.source_message_ids,
+      p_validation_issues: validation.issues,
+      p_facts: status === "confirmed"
+        ? validation.validFacts.map((item) => ({ text: item.text, source_message_ids: item.sourceMessageIds }))
+        : [],
+      p_feelings: validation.validFeelings.map((item) => ({ text: item.text, source_message_ids: item.sourceMessageIds })),
+    });
+    if (saveError) throw saveError;
+    const completedAt = new Date().toISOString();
+    const { error: completeError } = await supabase.from("diary_generation_jobs").update({
+      status: status === "confirmed" ? "succeeded" : "needs_review",
+      completed_at: completedAt, updated_at: completedAt, error_code: null,
+    }).eq("id", job.id);
+    if (completeError) throw completeError;
+  } catch (error) {
+    const completedAt = new Date().toISOString();
+    await supabase.from("diary_generation_jobs").update({
+      status: "failed", completed_at: completedAt, updated_at: completedAt,
+      error_code: String(error?.code || "diary_generation_failed").slice(0, 120),
+    }).eq("id", job.id);
+    console.error("Diary generation failed:", error);
+  }
+}
+
+function startDiaryJob(jobId) {
+  setImmediate(() => processDiaryGenerationJob(jobId).catch((error) => console.error("Diary job crashed:", error)));
+}
+
+async function createDiaryJobForLatestVersion({ userId, characterId, sharedDayId }) {
+  const { data: day, error: dayError } = await supabase.from("shared_life_days").select("*")
+    .eq("id", sharedDayId).eq("user_id", userId).eq("character_id", characterId).maybeSingle();
+  if (dayError) throw dayError;
+  if (!day) { const error = new Error("Shared life day not found"); error.status = 404; throw error; }
+  const { data: version, error: versionError } = await supabase.from("shared_life_day_versions").select("*")
+    .eq("shared_day_id", day.id).eq("user_id", userId).order("revision_number", { ascending: false }).limit(1).maybeSingle();
+  if (versionError) throw versionError;
+  if (!version || version.boundary_state !== "sealed") { const error = new Error("This shared day has not ended yet"); error.status = 409; throw error; }
+  const { data: existing, error: existingError } = await supabase.from("diary_generation_jobs").select("*")
+    .eq("shared_day_version_id", version.id).eq("user_id", userId)
+    .in("status", ["queued", "running", "succeeded"]).order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (existingError) throw existingError;
+  if (existing) return { job: existing, created: false };
+  const { count, error: countError } = await supabase.from("diary_generation_jobs").select("id", { count: "exact", head: true })
+    .eq("shared_day_version_id", version.id).eq("user_id", userId);
+  if (countError) throw countError;
+  const { data: job, error: insertError } = await supabase.from("diary_generation_jobs").insert({
+    user_id: userId, character_id: characterId, shared_day_id: day.id, shared_day_version_id: version.id,
+    attempt_number: Number(count || 0) + 1,
+  }).select().single();
+  if (insertError) throw insertError;
+  return { job, created: true };
+}
+
+app.post("/diary/shared-days/:sharedDayId/generate", async (req, res) => {
+  try {
+    const character = req.body.characterId
+      ? await getOwnedCharacter(req.body.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const result = await createDiaryJobForLatestVersion({
+      userId: req.user.id, characterId: character.id, sharedDayId: req.params.sharedDayId,
+    });
+    if (result.created) startDiaryJob(result.job.id);
+    res.status(result.created ? 202 : 200).json({ success: true, created: result.created, job: result.job });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/diary/entries", async (req, res) => {
+  try {
+    const character = req.query.characterId
+      ? await getOwnedCharacter(req.query.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const { data, error } = await supabase.from("diary_entries")
+      .select("*,shared_life_days(day_key)").eq("user_id", req.user.id).eq("character_id", character.id)
+      .order("created_at", { ascending: false }).limit(120);
+    if (error) throw error;
+    res.json({ success: true, entries: data || [] });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/diary/jobs/:jobId", async (req, res) => {
+  const { data, error } = await supabase.from("diary_generation_jobs").select("*")
+    .eq("id", req.params.jobId).eq("user_id", req.user.id).maybeSingle();
+  if (error) return res.status(500).json({ success: false, error: error.message });
+  if (!data) return res.status(404).json({ success: false, error: "Diary job not found" });
+  res.json({ success: true, job: data });
 });
 
 app.post("/messages/:messageId/select-variant", async (req, res) => {
