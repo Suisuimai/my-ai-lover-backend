@@ -36,3 +36,16 @@ test("rejects invented quotes, numbers, and times from the formal fact layer", (
   assert.equal(result.issues[0].kind, "fact");
   assert.match(result.issues[0].reasons.join(" "), /找不到/);
 });
+
+test("accepts diary-relative today and time words grounded by source timestamps", () => {
+  const midnightSource = [{
+    id: "s3", role: "user", occurred_at: "2026-09-26T16:03:00Z",
+    raw_content: "我还没睡。",
+  }];
+  const diary = parseGroundedDiary(JSON.stringify({
+    title: "零点还醒着", body_markdown: "今天零点她还没睡。",
+    facts: [{ text: "今天零点她还没睡。", evidence_message_numbers: [1], evidence_quotes: ["我还没睡"] }], feelings: [],
+  }), midnightSource);
+  const result = validateGroundedDiary(diary, midnightSource, { dayKey: "2026-09-27" });
+  assert.equal(result.issues.length, 0);
+});
