@@ -14,7 +14,7 @@ function removeFirst(text, target) {
     .replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function applyDiaryReview(entry, { action, issueIndex, replacementText }) {
+function applyDiaryReview(entry, { action, issueIndex, replacementText, restoredIssues = [] }) {
   if (!REVIEW_ACTIONS.has(action)) throw Object.assign(new Error("Unsupported diary review action"), { status: 400 });
   const issues = Array.isArray(entry.validation_issues) ? entry.validation_issues : [];
   let nextIssues = issues;
@@ -48,7 +48,7 @@ function applyDiaryReview(entry, { action, issueIndex, replacementText }) {
 
   if (action === "confirm_entry") nextIssues = [];
   if (action === "revoke_entry") {
-    nextIssues = [{
+    nextIssues = [...restoredIssues.filter((item) => item?.kind !== "manual_retraction"), {
       kind: "manual_retraction", itemIndex: null, text: "",
       reasons: ["妤妤撤回了整篇确认；这篇日记暂时不进入事实检索。"],
     }];

@@ -2370,7 +2370,14 @@ app.post("/diary/entries/:entryId/review", async (req, res) => {
       supersedesEventId = wholeEvents[0].id;
     }
 
-    const review = applyDiaryReview(entry, { action, issueIndex, replacementText });
+    let restoredIssues = [];
+    if (action === "revoke_entry" && entry.supersedes_entry_id) {
+      const { data: beforeConfirmation, error: beforeConfirmationError } = await supabase.from("diary_entries")
+        .select("validation_issues").eq("id", entry.supersedes_entry_id).eq("user_id", req.user.id).maybeSingle();
+      if (beforeConfirmationError) throw beforeConfirmationError;
+      restoredIssues = Array.isArray(beforeConfirmation?.validation_issues) ? beforeConfirmation.validation_issues : [];
+    }
+    const review = applyDiaryReview(entry, { action, issueIndex, replacementText, restoredIssues });
     const eventId = crypto.randomUUID();
     const resultEntryId = review.changesEntry ? crypto.randomUUID() : null;
     const sourceMessageIds = ["confirm_fact", "confirm_entry"].includes(action)

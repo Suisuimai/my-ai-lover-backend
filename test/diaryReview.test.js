@@ -31,3 +31,13 @@ test("whole-entry retraction returns a draft marker and keeps history append-onl
   assert.equal(result.status, "needs_review");
   assert.equal(result.validationIssues[0].kind, "manual_retraction");
 });
+
+test("whole-entry retraction restores unresolved issues from before confirmation", () => {
+  const originalIssue = { kind: "body", text: "下午发生了什么", reasons: ["原文中找不到时间：下午"] };
+  const result = applyDiaryReview({ body_markdown: "正文", validation_issues: [] }, {
+    action: "revoke_entry", restoredIssues: [originalIssue],
+  });
+  assert.equal(result.status, "needs_review");
+  assert.deepEqual(result.validationIssues[0], originalIssue);
+  assert.equal(result.validationIssues.at(-1).kind, "manual_retraction");
+});
