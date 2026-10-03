@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  FEATURE_DEFINITIONS, FEATURE_PURPOSES, connectionKind, isPrivateIp, legacyProviderForModel, modelCatalogEndpoint, modelEndpoint,
+  FEATURE_DEFINITIONS, FEATURE_PURPOSES, connectionKind, embeddingEndpoint, isPrivateIp, legacyProviderForModel, modelCatalogEndpoint, modelEndpoint,
   normalizeBaseUrl, normalizeModelCatalog, safeConnectionView,
 } = require("../core/apiConnections");
 
@@ -15,6 +15,11 @@ test("builds model catalog endpoints without duplicating API path segments", () 
   assert.equal(modelCatalogEndpoint("https://openrouter.ai/api/v1", "openai_compatible"), "https://openrouter.ai/api/v1/models");
   assert.equal(modelCatalogEndpoint("https://example.com/v1/chat/completions", "openai_compatible"), "https://example.com/v1/models");
   assert.equal(modelCatalogEndpoint("https://api.anthropic.com", "anthropic"), "https://api.anthropic.com/v1/models");
+});
+
+test("builds OpenAI-compatible embedding endpoints from gateway URLs", () => {
+  assert.equal(embeddingEndpoint("https://openrouter.ai/api/v1", "openai_compatible"), "https://openrouter.ai/api/v1/embeddings");
+  assert.throws(() => embeddingEndpoint("https://api.anthropic.com", "anthropic"), /OpenAI-compatible/);
 });
 
 test("normalizes common model catalog response shapes", () => {

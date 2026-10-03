@@ -18,5 +18,5 @@ blindly: the security migration intentionally deletes legacy demo sessions.
 The first V2 migration will bind existing sessions to a default character
 without deleting messages or `session_memories`.
 
-Current latest migration: `024_diary_review_annotations.sql`, which adds append-only
-manual confirmation, retraction, correction, and two-channel diary annotations.
+Current latest migration: `025_source_memory_recall.sql`, which adds immutable lexical
+and semantic coordinates on raw source messages plus a short-lived operational recall pointer.

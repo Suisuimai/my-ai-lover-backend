@@ -39,6 +39,7 @@ const CONTEXT_LAYER_DEFINITIONS = [
   ["topicDocuments", "on_demand_documents", "本次召回的按需 MD"],
   ["timelineMemories", "timeline_memories", "Timeline 记忆"],
   ["windowContinuity", "window_continuity", "窗口交接"],
+  ["recalledSharedDay", "recalled_shared_day", "本轮想起的共同生活"],
   ["followUps", "followups", "Followup 事项"],
   ["longTermMemories", "long_term_memories", "长期记忆召回"],
 ];
@@ -52,12 +53,13 @@ function buildModelContextLayers({
   topicDocuments,
   timelineMemories,
   windowContinuity,
+  recalledSharedDay,
   followUps,
   longTermMemories,
   memorySummary,
   recentMessages,
 }) {
-  const values = { systemPrompt, promptDocuments, characterProfile, userProfile, currentContext, topicDocuments, timelineMemories, windowContinuity, followUps, longTermMemories };
+  const values = { systemPrompt, promptDocuments, characterProfile, userProfile, currentContext, topicDocuments, timelineMemories, windowContinuity, recalledSharedDay, followUps, longTermMemories };
   const layers = CONTEXT_LAYER_DEFINITIONS.flatMap(([key, id, label]) => values[key]
     ? [{ id, label, role: "system", content: values[key] }]
     : []);
