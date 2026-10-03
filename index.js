@@ -38,6 +38,7 @@ const { buildHandoffPrompt, formatWindowContinuity, parseHandoffCandidate } = re
 const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
 const { groupSourceMessagesBySharedDay } = require("./core/sharedDays");
 const { buildGroundedDiaryPrompt, parseGroundedDiary, validateGroundedDiary } = require("./core/groundedDiary");
+const { applyDiaryReview, cleanText, reviewEventForAction } = require("./core/diaryReview");
 const {
   buildExperienceExtractionPrompt,
   buildDocumentMergePrompt,
@@ -1967,6 +1968,13 @@ async function processDiaryGenerationJob(jobId) {
     });
     const diary = parseGroundedDiary(raw, sourceMessages);
     const validation = validateGroundedDiary(diary, sourceMessages, { dayKey: day.day_key });
+    const importedDraft = sourceMessages.some((message) => message.source_kind === "claude_import");
+    if (importedDraft && !validation.issues.some((issue) => issue.kind === "imported_draft")) {
+      validation.issues.push({
+        kind: "imported_draft", itemIndex: null, text: "",
+        reasons: ["旧记录生成的日记默认保持草稿；只有妤妤主动确认后才进入未来检索。"],
+      });
+    }
     const status = validation.issues.length ? "needs_review" : "confirmed";
     const entryId = crypto.randomUUID();
     const { error: saveError } = await supabase.rpc("save_grounded_diary", {
@@ -2135,6 +2143,92 @@ app.get("/diary/entries/:entryId/sources", async (req, res) => {
       occurredAt: message.source_metadata?.original_message_created_at || message.occurred_at,
     }));
     res.json({ success: true, messages, partial: messages.length !== entry.source_message_ids.length });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/diary/review-events", async (req, res) => {
+  try {
+    const character = req.query.characterId
+      ? await getOwnedCharacter(req.query.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    const { data, error } = await supabase.from("diary_review_events").select("*")
+      .eq("user_id", req.user.id).eq("character_id", character.id)
+      .order("created_at", { ascending: true }).limit(1000);
+    if (error) throw error;
+    res.json({ success: true, events: data || [] });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/diary/entries/:entryId/review", async (req, res) => {
+  try {
+    const { data: entry, error: entryError } = await supabase.from("diary_entries").select("*")
+      .eq("id", req.params.entryId).eq("user_id", req.user.id).maybeSingle();
+    if (entryError) throw entryError;
+    if (!entry) return res.status(404).json({ success: false, error: "Diary entry not found" });
+    const { data: latest, error: latestError } = await supabase.from("diary_entries").select("id")
+      .eq("shared_day_id", entry.shared_day_id).eq("user_id", req.user.id)
+      .order("created_at", { ascending: false }).limit(1).maybeSingle();
+    if (latestError) throw latestError;
+    if (latest?.id !== entry.id) return res.status(409).json({ success: false, error: "This diary has a newer version; refresh before reviewing" });
+
+    const action = String(req.body.action || "");
+    const issueIndex = Number.isInteger(req.body.issueIndex) ? req.body.issueIndex : null;
+    const replacementText = cleanText(req.body.replacementText, 3000);
+    const content = cleanText(req.body.content, 8000);
+    const anchorKind = req.body.anchorKind === "sentence" ? "sentence" : "entry";
+    const anchorText = anchorKind === "sentence" ? cleanText(req.body.anchorText, 2000) : "";
+    if (anchorKind === "sentence" && (!anchorText || !entry.body_markdown.includes(anchorText))) {
+      return res.status(400).json({ success: false, error: "Choose a sentence from this diary as the annotation anchor" });
+    }
+    if (["add_factual_note", "add_relationship_note"].includes(action) && !content) {
+      return res.status(400).json({ success: false, error: "Please write the annotation first" });
+    }
+
+    let supersedesEventId = null;
+    if (action === "revoke_entry") {
+      const { data: wholeEvents, error: wholeError } = await supabase.from("diary_review_events")
+        .select("id,event_kind,created_at").eq("user_id", req.user.id).eq("shared_day_id", entry.shared_day_id)
+        .in("event_kind", ["entry_confirmed", "entry_confirmation_revoked"])
+        .order("created_at", { ascending: false }).limit(1);
+      if (wholeError) throw wholeError;
+      if (!wholeEvents?.length || wholeEvents[0].event_kind !== "entry_confirmed") {
+        return res.status(409).json({ success: false, error: "This diary has no active whole-entry confirmation to revoke" });
+      }
+      supersedesEventId = wholeEvents[0].id;
+    }
+
+    const review = applyDiaryReview(entry, { action, issueIndex, replacementText });
+    const eventId = crypto.randomUUID();
+    const resultEntryId = review.changesEntry ? crypto.randomUUID() : null;
+    const sourceMessageIds = ["confirm_fact", "confirm_entry"].includes(action)
+      ? entry.source_message_ids : [];
+    const { data: result, error: saveError } = await supabase.rpc("append_diary_review", {
+      p_event_id: eventId, p_user_id: req.user.id, p_entry_id: entry.id,
+      p_event_kind: reviewEventForAction(action),
+      p_scope: ["add_factual_note", "add_relationship_note"].includes(action) ? "annotation"
+        : action === "confirm_entry" || action === "revoke_entry" ? "entry" : "fact",
+      p_issue_index: issueIndex, p_anchor_kind: anchorKind, p_anchor_text: anchorText || null,
+      p_content: content || null, p_replacement_text: replacementText || null,
+      p_provenance: action === "add_relationship_note" ? "relationship_note" : "user_later_confirmation",
+      p_source_message_ids: sourceMessageIds, p_supersedes_event_id: supersedesEventId,
+      p_batch_id: null, p_result_entry_id: resultEntryId,
+      p_result_status: review.changesEntry ? review.status : null,
+      p_result_body_markdown: review.changesEntry ? review.bodyMarkdown : null,
+      p_result_validation_issues: review.changesEntry ? review.validationIssues : null,
+    });
+    if (saveError) throw saveError;
+    const response = { success: true, result };
+    if (resultEntryId) {
+      const { data: nextEntry, error: nextError } = await supabase.from("diary_entries").select("*,shared_life_days(day_key)")
+        .eq("id", resultEntryId).eq("user_id", req.user.id).single();
+      if (nextError) throw nextError;
+      response.entry = nextEntry;
+    }
+    res.status(201).json(response);
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });
   }
