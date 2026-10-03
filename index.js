@@ -39,7 +39,7 @@ const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentC
 const { groupSourceMessagesBySharedDay } = require("./core/sharedDays");
 const { buildGroundedDiaryPrompt, parseGroundedDiary, validateGroundedDiary } = require("./core/groundedDiary");
 const { applyDiaryReview, cleanText, reviewEventForAction } = require("./core/diaryReview");
-const { formatSharedDayRecall, lexicalTerms, rankSharedDays, selectSourceExcerpt, shouldContinueRecallPointer } = require("./core/sourceRecall");
+const { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("./core/sourceRecall");
 const {
   buildExperienceExtractionPrompt,
   buildDocumentMergePrompt,
@@ -1898,53 +1898,56 @@ async function sourceIndexCorpus(userId, characterId) {
   return rows;
 }
 
-async function readIndexedSourceIds(table, userId, characterId, filters = {}) {
-  const ids = new Set();
-  const pageSize = 1000;
+async function readIndexRows(table, columns, orderColumn, userId, characterId, filters = {}) {
+  const rows = []; const pageSize = 1000;
   for (let from = 0; ; from += pageSize) {
-    let query = supabase.from(table).select("source_message_id")
-      .eq("user_id", userId).eq("character_id", characterId)
-      .order("source_message_id").range(from, from + pageSize - 1);
+    let query = supabase.from(table).select(columns).eq("user_id", userId).eq("character_id", characterId)
+      .order(orderColumn).range(from, from + pageSize - 1);
     for (const [column, value] of Object.entries(filters)) query = query.eq(column, value);
-    const { data, error } = await query;
-    if (error) throw error;
-    for (const item of data || []) ids.add(item.source_message_id);
-    if (!data || data.length < pageSize) break;
+    const { data, error } = await query; if (error) throw error;
+    rows.push(...(data || [])); if (!data || data.length < pageSize) break;
   }
-  return ids;
+  return rows;
+}
+
+async function sourceRetrievalWindows(userId, characterId) {
+  return buildRetrievalWindows(await sourceIndexCorpus(userId, characterId)).map((window) => ({
+    ...window, windowKey: crypto.createHash("sha256").update(window.sourceMessageIds.join(":"), "utf8").digest("hex"),
+  }));
 }
 
 async function sourceIndexStatus(userId,characterId) {
-  const corpus=await sourceIndexCorpus(userId,characterId); const sourceIds=corpus.map((item)=>item.message.id);
-  const target=await getEmbeddingTarget(userId).catch(()=>null);
-  if(!sourceIds.length)return {sourceCount:0,lexicalCount:0,embeddingCount:0,embeddingConfigured:Boolean(target),embeddingModel:target?.model||null};
-  const currentIds=new Set(sourceIds);
-  const [lexicalIds,embeddingIds]=await Promise.all([
-    readIndexedSourceIds("source_message_search_documents",userId,characterId,{algorithm_version:"unicode-bigram-v1"}),
-    target?readIndexedSourceIds("source_message_embeddings",userId,characterId,{model_id:target.model}):Promise.resolve(new Set()),
-  ]);
-  const countCurrent=(ids)=>[...ids].filter((id)=>currentIds.has(id)).length;
-  return {sourceCount:sourceIds.length,lexicalCount:countCurrent(lexicalIds),embeddingCount:countCurrent(embeddingIds),embeddingConfigured:Boolean(target),embeddingModel:target?.model||null};
+  const windows=await sourceRetrievalWindows(userId,characterId); const target=await getEmbeddingTarget(userId).catch(()=>null);
+  if(!windows.length)return {sourceCount:0,windowCount:0,lexicalCount:0,embeddingCount:0,embeddingConfigured:Boolean(target),embeddingModel:target?.model||null,indexVersion:"raw-turn-window-v1"};
+  const currentKeys=new Set(windows.map((window)=>window.windowKey));
+  const indexedWindows=await readIndexRows("source_retrieval_windows","id,window_key","id",userId,characterId,{algorithm_version:"raw-turn-window-v1"});
+  const currentWindowIds=new Set(indexedWindows.filter((window)=>currentKeys.has(window.window_key)).map((window)=>window.id));
+  const embeddingRows=target?await readIndexRows("source_retrieval_window_embeddings","window_id","window_id",userId,characterId,{model_id:target.model}):[];
+  const embeddingCount=embeddingRows.filter((item)=>currentWindowIds.has(item.window_id)).length;
+  return {sourceCount:windows.length,windowCount:windows.length,lexicalCount:currentWindowIds.size,embeddingCount,embeddingConfigured:Boolean(target),embeddingModel:target?.model||null,indexVersion:"raw-turn-window-v1"};
 }
 
 async function buildSourceIndexBatch(userId,characterId,{includeEmbeddings=true,embeddingLimit=96}={}) {
-  const corpus=await sourceIndexCorpus(userId,characterId); if(!corpus.length)return sourceIndexStatus(userId,characterId);
-  const lexicalIds=await readIndexedSourceIds("source_message_search_documents",userId,characterId,{algorithm_version:"unicode-bigram-v1"});
-  const lexicalRows=corpus.filter((item)=>!lexicalIds.has(item.message.id)).map(({message,sharedDayId})=>({
-    user_id:userId,character_id:characterId,source_message_id:message.id,shared_day_id:sharedDayId,
-    lexical_terms:lexicalTerms(message.raw_content).length?lexicalTerms(message.raw_content):["__empty__"],
-    algorithm_version:"unicode-bigram-v1",occurred_at:message.source_metadata?.original_message_created_at||message.occurred_at,
+  const windows=await sourceRetrievalWindows(userId,characterId); if(!windows.length)return sourceIndexStatus(userId,characterId);
+  const existingWindows=await readIndexRows("source_retrieval_windows","id,window_key","id",userId,characterId,{algorithm_version:"raw-turn-window-v1"});
+  const existingKeys=new Set(existingWindows.map((item)=>item.window_key));
+  const lexicalRows=windows.filter((window)=>!existingKeys.has(window.windowKey)).map((window)=>({
+    user_id:userId,character_id:characterId,shared_day_id:window.sharedDayId,window_key:window.windowKey,
+    source_message_ids:window.sourceMessageIds,lexical_terms:window.lexicalTerms.length?window.lexicalTerms:["__empty__"],
+    algorithm_version:"raw-turn-window-v1",occurred_at:window.occurredAt,
   }));
-  for(let index=0;index<lexicalRows.length;index+=500){const {error}=await supabase.from("source_message_search_documents").upsert(lexicalRows.slice(index,index+500),{onConflict:"source_message_id,algorithm_version",ignoreDuplicates:true});if(error)throw error;}
-
+  for(let index=0;index<lexicalRows.length;index+=500){const {error}=await supabase.from("source_retrieval_windows").upsert(lexicalRows.slice(index,index+500),{onConflict:"user_id,character_id,window_key,algorithm_version",ignoreDuplicates:true});if(error)throw error;}
   const target=includeEmbeddings?await getEmbeddingTarget(userId):null;
   if(target){
-    const existingIds=await readIndexedSourceIds("source_message_embeddings",userId,characterId,{model_id:target.model});
-    const missing=corpus.filter((item)=>!existingIds.has(item.message.id)).slice(0,Math.max(1,Math.min(embeddingLimit,192)));
+    const storedWindows=await readIndexRows("source_retrieval_windows","id,window_key","id",userId,characterId,{algorithm_version:"raw-turn-window-v1"});
+    const idByKey=new Map(storedWindows.map((item)=>[item.window_key,item.id]));
+    const existingEmbeddings=await readIndexRows("source_retrieval_window_embeddings","window_id","window_id",userId,characterId,{model_id:target.model});
+    const embeddedIds=new Set(existingEmbeddings.map((item)=>item.window_id));
+    const missing=windows.filter((window)=>idByKey.has(window.windowKey)&&!embeddedIds.has(idByKey.get(window.windowKey))).slice(0,Math.max(1,Math.min(embeddingLimit,192)));
     for(let index=0;index<missing.length;index+=32){
-      const batch=missing.slice(index,index+32); const vectors=await callEmbeddings({userId,target,inputs:batch.map((item)=>String(item.message.raw_content||"").slice(0,12000))});
-      const rows=batch.map((item,offset)=>({user_id:userId,character_id:characterId,source_message_id:item.message.id,shared_day_id:item.sharedDayId,model_id:target.model,embedding:JSON.stringify(vectors[offset]),dimensions:vectors[offset].length}));
-      const {error}=await supabase.from("source_message_embeddings").upsert(rows,{onConflict:"source_message_id,model_id",ignoreDuplicates:true}); if(error)throw error;
+      const batch=missing.slice(index,index+32); const vectors=await callEmbeddings({userId,target,inputs:batch.map((window)=>window.rawText.slice(0,12000))});
+      const rows=batch.map((window,offset)=>({user_id:userId,character_id:characterId,window_id:idByKey.get(window.windowKey),model_id:target.model,embedding:JSON.stringify(vectors[offset]),dimensions:vectors[offset].length}));
+      const {error}=await supabase.from("source_retrieval_window_embeddings").upsert(rows,{onConflict:"window_id,model_id",ignoreDuplicates:true}); if(error)throw error;
     }
   }
   return sourceIndexStatus(userId,characterId);
@@ -1961,21 +1964,30 @@ async function loadConfirmedDiaryForDay(userId,characterId,sharedDayId) {
   if(error)throw error; return data?.status==="confirmed"?data:null;
 }
 
-async function recallSharedDay({userId,characterId,sessionId,message,allowSemantic=true,writePointer=true}) {
-  const terms=lexicalTerms(message); if(!terms.length)return "";
-  const lexicalResult=await supabase.rpc("match_source_lexical",{p_user_id:userId,p_character_id:characterId,p_terms:terms,p_limit:80});
+async function querySourceRecallCandidates({userId,characterId,message,allowSemantic=true}) {
+  const terms=retrievalQueryTerms(message); if(!terms.length)return {terms,lexicalMatches:[],semanticMatches:[],ranked:[],embeddingModel:null};
+  const lexicalResult=await supabase.rpc("match_source_window_lexical",{p_user_id:userId,p_character_id:characterId,p_terms:terms,p_limit:80});
   if(lexicalResult.error)throw lexicalResult.error;
+  const lexicalMatches=(lexicalResult.data||[]).filter((match)=>lexicalCandidateAccepted(match,terms));
+  const admittedDays=new Set(lexicalMatches.map((match)=>match.shared_day_id));
   let semanticMatches=[]; let target=null;
   if(allowSemantic){
-    try{target=await getEmbeddingTarget(userId);if(target){const [vector]=await callEmbeddings({userId,target,inputs:[message]});const semanticResult=await supabase.rpc("match_source_semantic",{p_user_id:userId,p_character_id:characterId,p_model_id:target.model,p_query_embedding:JSON.stringify(vector),p_limit:80});if(semanticResult.error)throw semanticResult.error;semanticMatches=(semanticResult.data||[]).filter((item)=>Number(item.similarity)>=0.62);}}
+    try{target=await getEmbeddingTarget(userId);if(target){const [vector]=await callEmbeddings({userId,target,inputs:[message]});const semanticResult=await supabase.rpc("match_source_window_semantic",{p_user_id:userId,p_character_id:characterId,p_model_id:target.model,p_query_embedding:JSON.stringify(vector),p_limit:80});if(semanticResult.error)throw semanticResult.error;semanticMatches=semanticResult.data||[];}}
     catch(error){console.error("Semantic source recall failed; lexical recall remains available:",error.message);}
   }
-  const ranked=rankSharedDays({lexicalMatches:lexicalResult.data||[],semanticMatches,queryTermCount:terms.length});
+  return {
+    terms,lexicalMatches,semanticMatches,embeddingModel:target?.model||null,
+    ranked:rankSharedDays({lexicalMatches,semanticMatches:semanticMatches.filter((item)=>admittedDays.has(item.shared_day_id)),queryTermCount:terms.length}),
+  };
+}
+
+async function recallSharedDay({userId,characterId,sessionId,message,allowSemantic=true,writePointer=true}) {
+  const {terms,ranked}=await querySourceRecallCandidates({userId,characterId,message,allowSemantic}); if(!terms.length)return "";
   let selected=null; let diary=null;
-  for(const candidate of ranked.slice(0,8)){if(candidate.score<0.2)continue;const found=await loadConfirmedDiaryForDay(userId,characterId,candidate.sharedDayId);if(found){selected=candidate;diary=found;break;}}
+  for(const candidate of ranked){const found=await loadConfirmedDiaryForDay(userId,characterId,candidate.sharedDayId);if(found){selected=candidate;diary=found;break;}}
   let pointer=null;
   if(!selected&&sessionId){const {data}=await supabase.from("memory_recall_pointers").select("*").eq("session_id",sessionId).eq("user_id",userId).eq("active",true).maybeSingle();pointer=data||null;if(pointer&&shouldContinueRecallPointer(message)){selected={sharedDayId:pointer.shared_day_id,anchorSourceMessageIds:pointer.anchor_source_message_ids,score:1};diary=await loadConfirmedDiaryForDay(userId,characterId,pointer.shared_day_id);}else if(pointer&&writePointer){await supabase.from("memory_recall_pointers").update({active:false,updated_at:new Date().toISOString()}).eq("session_id",sessionId).eq("user_id",userId);}}
-  if(!selected||!diary)return "";
+  if(!selected||!diary)return "本轮自动回忆检索没有找到达到可靠门槛且已经确认的旧事。不要拿相似但未达标的候选猜测，也不要假装已经想起来。";
   const [{data:day,error:dayError},{data:version,error:versionError},{data:annotations,error:annotationError}]=await Promise.all([
     supabase.from("shared_life_days").select("day_key").eq("id",selected.sharedDayId).eq("user_id",userId).single(),
     supabase.from("shared_life_day_versions").select("source_message_ids").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).order("revision_number",{ascending:false}).limit(1).single(),
@@ -2424,6 +2436,23 @@ app.post("/memory-index/build", async (req,res)=>{
     const character=req.body.characterId?await getOwnedCharacter(req.body.characterId,req.user.id):await getOrCreateDefaultCharacter(req.user.id);
     const status=await buildSourceIndexBatch(req.user.id,character.id,{includeEmbeddings:req.body.includeEmbeddings!==false,embeddingLimit:Math.min(192,Math.max(1,Number(req.body.embeddingLimit)||96))});
     res.json({success:true,status});
+  }catch(error){res.status(error.status||500).json({success:false,error:error.message});}
+});
+
+app.post("/memory-index/test", async (req,res)=>{
+  try{
+    const message=cleanText(req.body.message); if(!message)return res.status(400).json({success:false,error:"请输入要测试的回忆问法"});
+    const character=req.body.characterId?await getOwnedCharacter(req.body.characterId,req.user.id):await getOrCreateDefaultCharacter(req.user.id);
+    const result=await querySourceRecallCandidates({userId:req.user.id,characterId:character.id,message,allowSemantic:true});
+    const dayIds=[...new Set([...result.lexicalMatches,...result.semanticMatches].map((item)=>item.shared_day_id))];
+    const {data:days,error:dayError}=dayIds.length?await supabase.from("shared_life_days").select("id,day_key").eq("user_id",req.user.id).in("id",dayIds):{data:[],error:null};
+    if(dayError)throw dayError; const dayById=new Map((days||[]).map((day)=>[day.id,day.day_key]));
+    const {data:diaryStatuses,error:diaryStatusError}=dayIds.length?await supabase.from("diary_entries").select("shared_day_id,status,created_at").eq("user_id",req.user.id).eq("character_id",character.id).in("shared_day_id",dayIds).order("created_at",{ascending:false}):{data:[],error:null};
+    if(diaryStatusError)throw diaryStatusError; const confirmed=new Map();
+    for(const entry of diaryStatuses||[])if(!confirmed.has(entry.shared_day_id))confirmed.set(entry.shared_day_id,entry.status==="confirmed");
+    const bestByDay=(items,valueKey)=>{const seen=new Set();return items.filter((item)=>{if(seen.has(item.shared_day_id))return false;seen.add(item.shared_day_id);return true;}).slice(0,5).map((item)=>({dayKey:dayById.get(item.shared_day_id)||"未知日期",score:Number(item[valueKey]||0),confirmed:Boolean(confirmed.get(item.shared_day_id))}));};
+    const accepted=result.ranked.filter((item)=>confirmed.get(item.sharedDayId)).slice(0,5).map((item)=>({dayKey:dayById.get(item.sharedDayId)||"未知日期",score:item.score}));
+    res.json({success:true,test:{queryTerms:result.terms,embeddingModel:result.embeddingModel,lexical:bestByDay(result.lexicalMatches,"lexical_score"),semantic:bestByDay(result.semanticMatches,"similarity"),accepted,found:accepted.length>0}});
   }catch(error){res.status(error.status||500).json({success:false,error:error.message});}
 });
 
