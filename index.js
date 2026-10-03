@@ -39,6 +39,7 @@ const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentC
 const { groupSourceMessagesBySharedDay } = require("./core/sharedDays");
 const { buildGroundedDiaryPrompt, parseGroundedDiary, validateGroundedDiary } = require("./core/groundedDiary");
 const { applyDiaryReview, cleanText, reviewEventForAction } = require("./core/diaryReview");
+const { formatSharedDayRecall, lexicalTerms, rankSharedDays, selectSourceExcerpt, shouldContinueRecallPointer } = require("./core/sourceRecall");
 const {
   buildExperienceExtractionPrompt,
   buildDocumentMergePrompt,
@@ -57,6 +58,7 @@ const {
   FEATURE_DEFINITIONS,
   FEATURE_PURPOSES,
   connectionKind,
+  embeddingEndpoint,
   isPrivateIp,
   modelCatalogEndpoint,
   modelEndpoint,
@@ -221,6 +223,53 @@ async function getModelTarget({ userId, purpose, legacyModel }) {
     if (credential?.encrypted_key) provider.apiKey = decryptSecret(credential.encrypted_key);
   }
   return { ...provider, connectionId: null, model: legacyModel };
+}
+
+async function getEmbeddingTarget(userId) {
+  const { data: route, error: routeError } = await supabase.from("api_feature_routes")
+    .select("connection_id,model_id,enabled").eq("user_id", userId).eq("purpose", "embedding").maybeSingle();
+  if (routeError && !isMissingApiFoundation(routeError)) throw routeError;
+  if (!route?.enabled || !route.connection_id || !route.model_id) return null;
+  const { data: connection, error: connectionError } = await supabase.from("api_connections")
+    .select("id,label,base_url,encrypted_key,api_format,enabled").eq("id", route.connection_id).eq("user_id", userId).maybeSingle();
+  if (connectionError) throw connectionError;
+  if (!connection?.enabled || connection.api_format !== "openai_compatible") return null;
+  return {
+    name: connectionKind(connection), connectionId: connection.id, model: route.model_id,
+    endpoint: embeddingEndpoint(connection.base_url, connection.api_format), apiKey: decryptSecret(connection.encrypted_key),
+  };
+}
+
+async function callEmbeddings({ userId, inputs, target }) {
+  const startedAt = new Date(); const startedClock = Date.now(); let response; let payload = {}; let status = "failed";
+  try {
+    if (!target?.apiKey) throw new Error("Embedding connection is not configured");
+    response = await fetch(target.endpoint, {
+      method:"POST", redirect:"error",
+      headers:{"Content-Type":"application/json",Authorization:`Bearer ${target.apiKey}`},
+      body:JSON.stringify({model:target.model,input:inputs}),
+    });
+    payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || "Embedding request failed");
+    const vectors = [...(payload.data || [])].sort((left,right)=>left.index-right.index).map((item)=>item.embedding);
+    if (vectors.length !== inputs.length || vectors.some((vector)=>!Array.isArray(vector) || !vector.length)) {
+      throw new Error("Embedding response did not contain one vector per source message");
+    }
+    status = "succeeded"; return vectors;
+  } finally {
+    const usage = normalizeModelUsage(target?.name, payload);
+    await recordModelUsage({
+      user_id:userId,connection_id:target?.connectionId||null,purpose:"embedding",provider:target?.name||null,
+      requested_model:target?.model||null,resolved_model:payload.model||target?.model||null,status,http_status:response?.status||null,
+      error_code:status==="failed"?(response?.status?`http_${response.status}`:"local_error"):null,
+      input_tokens:usage.inputTokens,output_tokens:usage.outputTokens,total_tokens:usage.totalTokens,
+      cache_read_tokens:0,cache_write_tokens:0,cache_write_1h_tokens:0,cache_hit_tokens:0,cache_miss_tokens:0,
+      reasoning_tokens:0,provider_cost:usage.providerCost,cost_currency:usage.costCurrency,cost_source:usage.costSource,
+      duration_ms:Math.max(0,Date.now()-startedClock),preparation_ms:null,first_token_ms:null,
+      provider_request_id:payload.id||response?.headers?.get("x-request-id")||null,
+      started_at:startedAt.toISOString(),completed_at:new Date().toISOString(),provider_usage:usage.providerUsage,
+    });
+  }
 }
 
 async function validatePublicConnectionUrl(value) {
@@ -1833,6 +1882,113 @@ async function latestSharedDayVersions(dayIds, userId) {
   return latest;
 }
 
+async function sourceIndexCorpus(userId, characterId) {
+  const sourceMessages = await readAllOwnedSourceMessages(userId, characterId);
+  const sourceById = new Map(sourceMessages.map((message)=>[message.id,message]));
+  const groups = groupSourceMessagesBySharedDay(sourceMessages);
+  const { data: days, error: dayError } = await supabase.from("shared_life_days").select("id,day_key")
+    .eq("user_id",userId).eq("character_id",characterId);
+  if (dayError) throw dayError;
+  const dayByKey = new Map((days||[]).map((day)=>[day.day_key,day]));
+  const rows=[];
+  for(const group of groups){
+    const day=dayByKey.get(group.dayKey); if(!day)continue;
+    for(const sourceId of group.sourceMessageIds){const message=sourceById.get(sourceId);if(message)rows.push({message,sharedDayId:day.id});}
+  }
+  return rows;
+}
+
+async function readIndexedSourceIds(table, userId, characterId, filters = {}) {
+  const ids = new Set();
+  const pageSize = 1000;
+  for (let from = 0; ; from += pageSize) {
+    let query = supabase.from(table).select("source_message_id")
+      .eq("user_id", userId).eq("character_id", characterId)
+      .order("source_message_id").range(from, from + pageSize - 1);
+    for (const [column, value] of Object.entries(filters)) query = query.eq(column, value);
+    const { data, error } = await query;
+    if (error) throw error;
+    for (const item of data || []) ids.add(item.source_message_id);
+    if (!data || data.length < pageSize) break;
+  }
+  return ids;
+}
+
+async function sourceIndexStatus(userId,characterId) {
+  const corpus=await sourceIndexCorpus(userId,characterId); const sourceIds=corpus.map((item)=>item.message.id);
+  const target=await getEmbeddingTarget(userId).catch(()=>null);
+  if(!sourceIds.length)return {sourceCount:0,lexicalCount:0,embeddingCount:0,embeddingConfigured:Boolean(target),embeddingModel:target?.model||null};
+  const currentIds=new Set(sourceIds);
+  const [lexicalIds,embeddingIds]=await Promise.all([
+    readIndexedSourceIds("source_message_search_documents",userId,characterId,{algorithm_version:"unicode-bigram-v1"}),
+    target?readIndexedSourceIds("source_message_embeddings",userId,characterId,{model_id:target.model}):Promise.resolve(new Set()),
+  ]);
+  const countCurrent=(ids)=>[...ids].filter((id)=>currentIds.has(id)).length;
+  return {sourceCount:sourceIds.length,lexicalCount:countCurrent(lexicalIds),embeddingCount:countCurrent(embeddingIds),embeddingConfigured:Boolean(target),embeddingModel:target?.model||null};
+}
+
+async function buildSourceIndexBatch(userId,characterId,{includeEmbeddings=true,embeddingLimit=96}={}) {
+  const corpus=await sourceIndexCorpus(userId,characterId); if(!corpus.length)return sourceIndexStatus(userId,characterId);
+  const lexicalIds=await readIndexedSourceIds("source_message_search_documents",userId,characterId,{algorithm_version:"unicode-bigram-v1"});
+  const lexicalRows=corpus.filter((item)=>!lexicalIds.has(item.message.id)).map(({message,sharedDayId})=>({
+    user_id:userId,character_id:characterId,source_message_id:message.id,shared_day_id:sharedDayId,
+    lexical_terms:lexicalTerms(message.raw_content).length?lexicalTerms(message.raw_content):["__empty__"],
+    algorithm_version:"unicode-bigram-v1",occurred_at:message.source_metadata?.original_message_created_at||message.occurred_at,
+  }));
+  for(let index=0;index<lexicalRows.length;index+=500){const {error}=await supabase.from("source_message_search_documents").upsert(lexicalRows.slice(index,index+500),{onConflict:"source_message_id,algorithm_version",ignoreDuplicates:true});if(error)throw error;}
+
+  const target=includeEmbeddings?await getEmbeddingTarget(userId):null;
+  if(target){
+    const existingIds=await readIndexedSourceIds("source_message_embeddings",userId,characterId,{model_id:target.model});
+    const missing=corpus.filter((item)=>!existingIds.has(item.message.id)).slice(0,Math.max(1,Math.min(embeddingLimit,192)));
+    for(let index=0;index<missing.length;index+=32){
+      const batch=missing.slice(index,index+32); const vectors=await callEmbeddings({userId,target,inputs:batch.map((item)=>String(item.message.raw_content||"").slice(0,12000))});
+      const rows=batch.map((item,offset)=>({user_id:userId,character_id:characterId,source_message_id:item.message.id,shared_day_id:item.sharedDayId,model_id:target.model,embedding:JSON.stringify(vectors[offset]),dimensions:vectors[offset].length}));
+      const {error}=await supabase.from("source_message_embeddings").upsert(rows,{onConflict:"source_message_id,model_id",ignoreDuplicates:true}); if(error)throw error;
+    }
+  }
+  return sourceIndexStatus(userId,characterId);
+}
+
+async function continueSourceIndexIfStarted(userId,characterId) {
+  const status=await sourceIndexStatus(userId,characterId);
+  if(status.lexicalCount>0)await buildSourceIndexBatch(userId,characterId,{includeEmbeddings:status.embeddingConfigured,embeddingLimit:192});
+}
+
+async function loadConfirmedDiaryForDay(userId,characterId,sharedDayId) {
+  const {data,error}=await supabase.from("diary_entries").select("*").eq("user_id",userId).eq("character_id",characterId).eq("shared_day_id",sharedDayId)
+    .order("created_at",{ascending:false}).limit(1).maybeSingle();
+  if(error)throw error; return data?.status==="confirmed"?data:null;
+}
+
+async function recallSharedDay({userId,characterId,sessionId,message,allowSemantic=true,writePointer=true}) {
+  const terms=lexicalTerms(message); if(!terms.length)return "";
+  const lexicalResult=await supabase.rpc("match_source_lexical",{p_user_id:userId,p_character_id:characterId,p_terms:terms,p_limit:80});
+  if(lexicalResult.error)throw lexicalResult.error;
+  let semanticMatches=[]; let target=null;
+  if(allowSemantic){
+    try{target=await getEmbeddingTarget(userId);if(target){const [vector]=await callEmbeddings({userId,target,inputs:[message]});const semanticResult=await supabase.rpc("match_source_semantic",{p_user_id:userId,p_character_id:characterId,p_model_id:target.model,p_query_embedding:JSON.stringify(vector),p_limit:80});if(semanticResult.error)throw semanticResult.error;semanticMatches=(semanticResult.data||[]).filter((item)=>Number(item.similarity)>=0.62);}}
+    catch(error){console.error("Semantic source recall failed; lexical recall remains available:",error.message);}
+  }
+  const ranked=rankSharedDays({lexicalMatches:lexicalResult.data||[],semanticMatches,queryTermCount:terms.length});
+  let selected=null; let diary=null;
+  for(const candidate of ranked.slice(0,8)){if(candidate.score<0.2)continue;const found=await loadConfirmedDiaryForDay(userId,characterId,candidate.sharedDayId);if(found){selected=candidate;diary=found;break;}}
+  let pointer=null;
+  if(!selected&&sessionId){const {data}=await supabase.from("memory_recall_pointers").select("*").eq("session_id",sessionId).eq("user_id",userId).eq("active",true).maybeSingle();pointer=data||null;if(pointer&&shouldContinueRecallPointer(message)){selected={sharedDayId:pointer.shared_day_id,anchorSourceMessageIds:pointer.anchor_source_message_ids,score:1};diary=await loadConfirmedDiaryForDay(userId,characterId,pointer.shared_day_id);}else if(pointer&&writePointer){await supabase.from("memory_recall_pointers").update({active:false,updated_at:new Date().toISOString()}).eq("session_id",sessionId).eq("user_id",userId);}}
+  if(!selected||!diary)return "";
+  const [{data:day,error:dayError},{data:version,error:versionError},{data:annotations,error:annotationError}]=await Promise.all([
+    supabase.from("shared_life_days").select("day_key").eq("id",selected.sharedDayId).eq("user_id",userId).single(),
+    supabase.from("shared_life_day_versions").select("source_message_ids").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).order("revision_number",{ascending:false}).limit(1).single(),
+    supabase.from("diary_review_events").select("*").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).in("event_kind",["factual_note_added","relationship_note_added"]).order("created_at",{ascending:true}),
+  ]);
+  if(dayError||versionError||annotationError)throw dayError||versionError||annotationError;
+  const byId=new Map((await readAllOwnedSourceMessages(userId,characterId)).map((source)=>[source.id,source]));
+  const messages=(version.source_message_ids||[]).map((id)=>byId.get(id)).filter(Boolean).map((source)=>({id:source.id,role:source.role,content:source.raw_content,occurredAt:source.source_metadata?.original_message_created_at||source.occurred_at}));
+  const excerpt=selectSourceExcerpt(messages,selected.anchorSourceMessageIds,12000);
+  if(writePointer&&sessionId){await supabase.from("memory_recall_pointers").upsert({session_id:sessionId,user_id:userId,character_id:characterId,shared_day_id:selected.sharedDayId,anchor_source_message_ids:selected.anchorSourceMessageIds,pointer_label:`刚才正在谈 ${day.day_key} 的共同生活`,query_terms:terms,active:true,recalled_at:new Date().toISOString(),updated_at:new Date().toISOString()},{onConflict:"session_id"});}
+  return formatSharedDayRecall({dayKey:day.day_key,diary,annotations:annotations||[],messages:excerpt.messages,partial:excerpt.partial});
+}
+
 app.get("/diary/shared-days", async (req, res) => {
   try {
     const character = req.query.characterId
@@ -1995,6 +2151,7 @@ async function processDiaryGenerationJob(jobId) {
       completed_at: completedAt, updated_at: completedAt, error_code: null,
     }).eq("id", job.id);
     if (completeError) throw completeError;
+    void continueSourceIndexIfStarted(job.user_id,job.character_id).catch((error)=>console.error("Background source indexing deferred:",error.message));
   } catch (error) {
     const completedAt = new Date().toISOString();
     await supabase.from("diary_generation_jobs").update({
@@ -2257,6 +2414,19 @@ app.get("/diary/jobs/:jobId", async (req, res) => {
   res.json({ success: true, job: data });
 });
 
+app.get("/memory-index/status", async (req,res)=>{
+  try{const character=req.query.characterId?await getOwnedCharacter(req.query.characterId,req.user.id):await getOrCreateDefaultCharacter(req.user.id);res.json({success:true,status:await sourceIndexStatus(req.user.id,character.id)});}
+  catch(error){res.status(error.status||500).json({success:false,error:error.message});}
+});
+
+app.post("/memory-index/build", async (req,res)=>{
+  try{
+    const character=req.body.characterId?await getOwnedCharacter(req.body.characterId,req.user.id):await getOrCreateDefaultCharacter(req.user.id);
+    const status=await buildSourceIndexBatch(req.user.id,character.id,{includeEmbeddings:req.body.includeEmbeddings!==false,embeddingLimit:Math.min(192,Math.max(1,Number(req.body.embeddingLimit)||96))});
+    res.json({success:true,status});
+  }catch(error){res.status(error.status||500).json({success:false,error:error.message});}
+});
+
 app.post("/messages/:messageId/select-variant", async (req, res) => {
   try {
     const { data: selected, error: selectedError } = await supabase.from("messages")
@@ -2345,6 +2515,9 @@ app.post("/prompt-preview", async (req, res) => {
       relevantFollowUps = selectContextualFollowUps(conversationalFollowUps, message, recentMessages, 1);
     }
     const onDemandDocuments = selectRelevantPromptDocuments(promptDocuments, message, 3);
+    const recalledSharedDay = message ? await recallSharedDay({
+      userId:req.user.id,characterId:character.id,sessionId,message,allowSemantic:false,writePointer:false,
+    }).catch((error)=>{console.error("Prompt preview source recall failed:",error.message);return "";}) : "";
     const modelTarget = await getModelTarget({
       userId: req.user.id,
       purpose: "companion_chat",
@@ -2360,6 +2533,7 @@ app.post("/prompt-preview", async (req, res) => {
       characterProfile: formatCharacterProfile(character),
       userProfile: formatUserProfile(userProfile),
       windowContinuity: formatWindowContinuity(continuity.handoff, continuity.tailMessages),
+      recalledSharedDay,
       followUps: formatFollowUps(relevantFollowUps),
       longTermMemories: formatLongTermMemories(relevantMemories),
       memorySummary: summaryResult.data?.summary,
@@ -3147,10 +3321,13 @@ app.put("/api-feature-routes/:purpose", async (req, res) => {
     }
 
     if (!connectionId || !modelId) return res.status(400).json({ success: false, error: "Connection and model are required" });
-    const { data: connection, error: connectionError } = await supabase.from("api_connections").select("id")
+    const { data: connection, error: connectionError } = await supabase.from("api_connections").select("id,api_format")
       .eq("id", connectionId).eq("user_id", req.user.id).eq("enabled", true).maybeSingle();
     if (connectionError) throw connectionError;
     if (!connection) return res.status(400).json({ success: false, error: "Choose an enabled connection" });
+    if (purpose === "embedding" && connection.api_format !== "openai_compatible") {
+      return res.status(400).json({ success: false, error: "Semantic recall requires an OpenAI-compatible connection" });
+    }
 
     const { data, error } = await supabase.from("api_feature_routes").upsert({
       user_id: req.user.id,
@@ -3437,7 +3614,7 @@ app.post("/chat", async (req, res) => {
       if (error) throw error;
       return data || [];
     };
-    const [promptDocuments, continuity, relevantMemories, statusFollowUps, memorySummary, recentHistory] = await Promise.all([
+    const [promptDocuments, continuity, relevantMemories, statusFollowUps, memorySummary, recentHistory, recalledSharedDay] = await Promise.all([
       loadPromptDocuments(req.user.id, character.id),
       loadWindowContinuity(req.user.id, req.sessionRecord),
       recallMemories(req.user.id, character.id, message).catch((error) => {
@@ -3450,6 +3627,9 @@ app.post("/chat", async (req, res) => {
       }),
       loadMemorySummary(),
       loadRecentHistory(),
+      recallSharedDay({userId:req.user.id,characterId:character.id,sessionId,message,allowSemantic:true,writePointer:true}).catch((error)=>{
+        console.error("Shared-day recall failed:",error.message); return "";
+      }),
     ]);
     const onDemandDocuments = selectRelevantPromptDocuments(promptDocuments, message, 3);
     let relevantFollowUps = [];
@@ -3470,6 +3650,7 @@ app.post("/chat", async (req, res) => {
       characterProfile: formatCharacterProfile(character),
       userProfile: formatUserProfile(userProfile),
       windowContinuity: formatWindowContinuity(continuity.handoff, continuity.tailMessages),
+      recalledSharedDay,
       followUps: formatFollowUps(relevantFollowUps),
       longTermMemories: formatLongTermMemories(relevantMemories),
       memorySummary,

@@ -105,3 +105,19 @@ test("buildModelContextLayers exposes labels and model messages mark the fixed-d
     ...(id === "always_documents" ? { cacheBoundary: true } : {}),
   })));
 });
+
+test("recalled shared-day memory sits after handoff and before current conversation", () => {
+  const layers = buildModelContextLayers({
+    promptDocuments: "Stable documents",
+    windowContinuity: "Previous window handoff",
+    recalledSharedDay: "A recalled shared day with source messages",
+    recentMessages: [{ role: "user", content: "Then what happened?" }],
+  });
+
+  assert.deepEqual(layers.map(({ id }) => id), [
+    "always_documents",
+    "window_continuity",
+    "recalled_shared_day",
+    "recent_message_1",
+  ]);
+});

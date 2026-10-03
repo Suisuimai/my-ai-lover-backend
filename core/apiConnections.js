@@ -12,7 +12,7 @@ const FEATURE_DEFINITIONS = [
   { id: "conversation_title", name: "窗口标题", description: "默认跟随伴侣聊天", follows: "companion_chat" },
   { id: "conversation_summary", name: "窗口摘要", description: "默认跟随记忆提取", follows: "long_term_memory_extraction" },
   { id: "followup_interpretation", name: "Followup 判断", description: "默认跟随记忆提取", follows: "long_term_memory_extraction" },
-  { id: "embedding", name: "语义检索", description: "为未来的语义召回生成向量", hidden: true },
+  { id: "embedding", name: "语义检索", description: "为原始消息生成可复用的语义坐标", recommendation: "建议使用便宜的 embedding 模型" },
 ];
 const FEATURE_PURPOSES = new Set(FEATURE_DEFINITIONS.map((feature) => feature.id));
 
@@ -73,6 +73,14 @@ function modelCatalogEndpoint(baseUrl, apiFormat) {
   return `${normalized}/models`;
 }
 
+function embeddingEndpoint(baseUrl, apiFormat) {
+  if (apiFormat !== "openai_compatible") throw new Error("This connection does not expose an OpenAI-compatible embeddings endpoint");
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (normalized.endsWith("/chat/completions")) return `${normalized.slice(0, -"/chat/completions".length)}/embeddings`;
+  if (normalized.endsWith("/embeddings")) return normalized;
+  return `${normalized}/embeddings`;
+}
+
 function normalizeModelCatalog(payload) {
   const rows = Array.isArray(payload?.data) ? payload.data
     : Array.isArray(payload?.models) ? payload.models
@@ -123,6 +131,7 @@ module.exports = {
   FEATURE_DEFINITIONS,
   FEATURE_PURPOSES,
   connectionKind,
+  embeddingEndpoint,
   isPrivateIp,
   legacyProviderForModel,
   modelCatalogEndpoint,
