@@ -18,5 +18,5 @@ blindly: the security migration intentionally deletes legacy demo sessions.
 The first V2 migration will bind existing sessions to a default character
 without deleting messages or `session_memories`.
 
-Current latest migration: `019_immutable_source_ledger.sql`, which gives every
-live or imported raw message a permanent ID and records edits as appended revisions.
+Current latest migration: `024_diary_review_annotations.sql`, which adds append-only
+manual confirmation, retraction, correction, and two-channel diary annotations.
