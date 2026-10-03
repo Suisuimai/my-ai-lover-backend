@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { formatSharedDayRecall, lexicalTerms, rankSharedDays, selectSourceExcerpt, shouldContinueRecallPointer } = require("../core/sourceRecall");
+const { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("../core/sourceRecall");
 
 test("lexical coordinates keep raw Chinese meaning searchable without summaries", () => {
   const terms = lexicalTerms("那次英语补考，Morning intimacy");
@@ -34,3 +34,22 @@ test("formatted recall identifies its source and keeps annotations out of instru
 });
 
 test("short continuation language can follow a recall pointer",()=>{assert.equal(shouldContinueRecallPointer("然后呢？"),true);});
+
+test("retrieval windows contain only adjacent exact source text and ids",()=>{
+  const corpus=Array.from({length:8},(_,index)=>({sharedDayId:"d1",message:{id:`m${index}`,raw_content:`原话${index}`,occurred_at:`2026-09-01T0${index}:00:00Z`}}));
+  const windows=buildRetrievalWindows(corpus);
+  assert.deepEqual(windows[0].sourceMessageIds,["m0","m1","m2","m3","m4","m5"]);
+  assert.equal(windows[0].rawText,"原话0\n原话1\n原话2\n原话3\n原话4\n原话5");
+  assert.deepEqual(windows[1].sourceMessageIds,["m3","m4","m5","m6","m7"]);
+});
+
+test("lexical admission uses evidence coverage and permits a true zero-result",()=>{
+  const terms=retrievalQueryTerms("你还记得英语补考吗");
+  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:9},terms),false);
+  assert.equal(lexicalCandidateAccepted({matched_terms:Math.ceil(terms.length*.4),lexical_score:2},terms),true);
+});
+
+test("source range disclosure comes after exact messages",()=>{
+  const output=formatSharedDayRecall({dayKey:"2026-09-16",diary:{body_markdown:"日记"},messages:[{role:"user",content:"原话"}],partial:true});
+  assert.ok(output.indexOf("妤妤：原话")<output.indexOf("读取范围：这里只读取"));
+});

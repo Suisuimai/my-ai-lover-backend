@@ -9,12 +9,56 @@ function lexicalTerms(value, limit = 160) {
   return [...terms].filter((term) => term.length <= 80).slice(0, limit);
 }
 
+function retrievalQueryTerms(value, limit = 80) {
+  return lexicalTerms(value, limit * 2)
+    .filter((term) => /^[a-z0-9]/.test(term) ? term.length >= 2 : term.length >= 2)
+    .slice(0, limit);
+}
+
+function buildRetrievalWindows(corpus, { size = 6, stride = 3 } = {}) {
+  const byDay = new Map();
+  for (const item of corpus || []) {
+    if (!byDay.has(item.sharedDayId)) byDay.set(item.sharedDayId, []);
+    byDay.get(item.sharedDayId).push(item.message);
+  }
+  const windows = [];
+  for (const [sharedDayId, messages] of byDay) {
+    const ordered = [...messages].sort((left, right) => new Date(left.source_metadata?.original_message_created_at || left.occurred_at)
+      - new Date(right.source_metadata?.original_message_created_at || right.occurred_at));
+    for (let start = 0; start < ordered.length; start += stride) {
+      const slice = ordered.slice(start, start + size);
+      if (!slice.length) break;
+      const rawText = slice.map((message) => String(message.raw_content || "")).join("\n");
+      windows.push({
+        sharedDayId,
+        sourceMessageIds: slice.map((message) => message.id),
+        rawText,
+        lexicalTerms: lexicalTerms(rawText),
+        occurredAt: slice[0].source_metadata?.original_message_created_at || slice[0].occurred_at,
+      });
+      if (start + size >= ordered.length) break;
+    }
+  }
+  return windows;
+}
+
+function lexicalCandidateAccepted(match, queryTerms) {
+  const matched = Number(match?.matched_terms || 0);
+  const termCount = Math.max(1, new Set(queryTerms || []).size);
+  const coverage = matched / termCount;
+  const hasDistinctiveSingleTerm = termCount === 1 && String(queryTerms?.[0] || "").length >= 4;
+  const requiredMatches = termCount <= 3 ? 2 : Math.max(3, Math.ceil(termCount * 0.28));
+  return Number(match?.lexical_score || 0) > 0
+    && (hasDistinctiveSingleTerm || (matched >= requiredMatches && coverage >= 0.28));
+}
+
 function rankSharedDays({ lexicalMatches = [], semanticMatches = [], queryTermCount = 1 }) {
   const scores = new Map();
   const add = (match, amount) => {
     const current = scores.get(match.shared_day_id) || { sharedDayId: match.shared_day_id, score: 0, anchorSourceMessageIds: [] };
     current.score += amount;
-    if (match.source_message_id && !current.anchorSourceMessageIds.includes(match.source_message_id)) current.anchorSourceMessageIds.push(match.source_message_id);
+    const sourceIds = match.source_message_ids || (match.source_message_id ? [match.source_message_id] : []);
+    for (const sourceId of sourceIds) if (!current.anchorSourceMessageIds.includes(sourceId)) current.anchorSourceMessageIds.push(sourceId);
     scores.set(match.shared_day_id, current);
   };
   for (const match of lexicalMatches) {
@@ -63,8 +107,11 @@ function formatSharedDayRecall({ dayKey, diary, annotations = [], messages = [],
   const relational = annotations.filter((event) => event.event_kind === "relationship_note_added");
   if (factual.length) blocks.push(`妤妤后来补充的背景（不是当日原话）：\n${factual.map((event) => `- ${event.content}`).join("\n")}`);
   if (relational.length) blocks.push(`这一天，妤妤在日记旁边留了话：\n${relational.map((event) => `- ${event.content}`).join("\n")}`);
-  if (messages.length) blocks.push(`${partial ? "这里只读取了这一天的一部分原话。" : "下面是这一天的原始对话。"}\n${messages.map((message) => `${message.role === "user" ? "妤妤" : "季疏"}：${message.content}`).join("\n")}`);
+  if (messages.length) {
+    blocks.push(`下面是这一天的原始对话：\n${messages.map((message) => `${message.role === "user" ? "妤妤" : "季疏"}：${message.content}`).join("\n")}`);
+    blocks.push(partial ? "读取范围：这里只读取了这一天的一部分。" : "读取范围：已经读取这一天的完整原话。");
+  }
   return blocks.join("\n\n");
 }
 
-module.exports = { formatSharedDayRecall, lexicalTerms, rankSharedDays, selectSourceExcerpt, shouldContinueRecallPointer };
+module.exports = { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer };
