@@ -2489,7 +2489,20 @@ app.post("/memory-index/test", async (req,res)=>{
     if(diaryStatusError)throw diaryStatusError; const confirmed=new Map();
     for(const entry of diaryStatuses||[])if(!confirmed.has(entry.shared_day_id))confirmed.set(entry.shared_day_id,entry.status==="confirmed");
     const bestByDay=(items,valueKey)=>{const seen=new Set();return items.filter((item)=>{if(seen.has(item.shared_day_id))return false;seen.add(item.shared_day_id);return true;}).slice(0,5).map((item)=>({dayKey:dayById.get(item.shared_day_id)||"未知日期",score:Number(item[valueKey]||0),confirmed:Boolean(confirmed.get(item.shared_day_id))}));};
-    const accepted=result.ranked.slice(0,5).map((item)=>({dayKey:dayById.get(item.sharedDayId)||"未知日期",score:item.score,confirmed:Boolean(confirmed.get(item.sharedDayId))}));
+    const lexicalByDay=new Map();
+    for(const item of result.lexicalMatches)if(!lexicalByDay.has(item.shared_day_id))lexicalByDay.set(item.shared_day_id,item);
+    const semanticDays=new Set(result.semanticMatches.map((item)=>item.shared_day_id));
+    const sourceById=new Map((await readAllOwnedSourceMessages(req.user.id,character.id)).map((source)=>[source.id,source]));
+    const accepted=result.ranked.slice(0,5).map((item)=>{
+      const lexical=lexicalByDay.get(item.sharedDayId); const sourceIds=lexical?.source_message_ids||item.anchorSourceMessageIds||[];
+      const evidence=sourceIds.map((id)=>sourceById.get(id)).filter(Boolean).map((source)=>({
+        id:source.id,role:source.role,content:source.raw_content,
+        occurredAt:source.source_metadata?.original_message_created_at||source.occurred_at,
+      }));
+      const normalizedEvidence=evidence.map((message)=>String(message.content||"").normalize("NFKC").toLowerCase()).join("\n");
+      const matchedTerms=result.terms.filter((term)=>normalizedEvidence.includes(String(term).normalize("NFKC").toLowerCase()));
+      return {dayKey:dayById.get(item.sharedDayId)||"未知日期",score:item.score,confirmed:Boolean(confirmed.get(item.sharedDayId)),channels:semanticDays.has(item.sharedDayId)?["BM25","BGE-M3"]:["BM25"],matchedTerms,evidence};
+    });
     res.json({success:true,test:{queryTerms:result.terms,embeddingModel:result.embeddingModel,lexical:bestByDay(result.lexicalMatches,"lexical_score"),semantic:bestByDay(result.semanticMatches,"similarity"),accepted,found:accepted.length>0}});
   }catch(error){res.status(error.status||500).json({success:false,error:error.message});}
 });
