@@ -42,41 +42,23 @@ function buildRetrievalWindows(corpus, { size = 6, stride = 3 } = {}) {
   return windows;
 }
 
-// Calibrated against the imported Chinese source corpus (2026-10-04):
-// 家教 ~= 4.38, 今天 ~= 2.41, 我们 ~= 2.83. Keep this fixed unless a
-// future corpus calibration deliberately replaces it with documented scores.
-const SINGLE_CHINESE_BIGRAM_MIN_BM25 = 3;
-
-function lexicalCandidateAccepted(match, queryTerms) {
-  const matched = Number(match?.matched_terms || 0);
-  const termCount = Math.max(1, new Set(queryTerms || []).size);
-  const coverage = matched / termCount;
-  const score = Number(match?.lexical_score || 0);
-  const singleTerm = String(queryTerms?.[0] || "");
-  const hasDistinctiveSingleTerm = termCount === 1 && String(queryTerms?.[0] || "").length >= 4;
-  const hasRareChineseBigram = termCount === 1
-    && /^[\p{Script=Han}]{2}$/u.test(singleTerm)
-    && score >= SINGLE_CHINESE_BIGRAM_MIN_BM25;
-  const requiredMatches = termCount <= 3 ? 2 : Math.max(3, Math.ceil(termCount * 0.28));
-  return score > 0
-    && (hasDistinctiveSingleTerm || hasRareChineseBigram || (matched >= requiredMatches && coverage >= 0.28));
+function lexicalCandidateAccepted(match) {
+  return Number(match?.matched_terms||0)>0&&Number(match?.lexical_score||0)>0;
 }
 
-function rankSharedDays({ lexicalMatches = [], semanticMatches = [], queryTermCount = 1 }) {
+function rankSharedDays({ lexicalMatches = [], semanticMatches = [], rrfK = 60 }) {
   const scores = new Map();
-  const add = (match, amount) => {
+  const add = (match,amount,{anchor=false}={}) => {
     const current = scores.get(match.shared_day_id) || { sharedDayId: match.shared_day_id, score: 0, anchorSourceMessageIds: [] };
     current.score += amount;
-    const sourceIds = match.source_message_ids || (match.source_message_id ? [match.source_message_id] : []);
-    for (const sourceId of sourceIds) if (!current.anchorSourceMessageIds.includes(sourceId)) current.anchorSourceMessageIds.push(sourceId);
+    if(anchor){const sourceIds=match.source_message_ids||(match.source_message_id?[match.source_message_id]:[]);for(const sourceId of sourceIds)if(!current.anchorSourceMessageIds.includes(sourceId))current.anchorSourceMessageIds.push(sourceId);}
     scores.set(match.shared_day_id, current);
   };
-  for (const match of lexicalMatches) {
-    const bm25 = Number(match.lexical_score || 0);
-    const normalized = bm25 > 0 ? bm25 / (bm25 + 4) : Math.min(1, Number(match.matched_terms || 0) / Math.max(1, queryTermCount));
-    add(match, normalized * 0.58);
-  }
-  for (const match of semanticMatches) add(match, Math.max(0, Number(match.similarity || 0)) * 0.42);
+  const bestRankByDay=(items)=>{const ranks=new Map();items.forEach((item,index)=>{if(!ranks.has(item.shared_day_id))ranks.set(item.shared_day_id,index+1);});return ranks;};
+  const lexicalRanks=bestRankByDay(lexicalMatches); const lexicalDays=new Set(lexicalRanks.keys());
+  const admittedSemantic=semanticMatches.filter((item)=>lexicalDays.has(item.shared_day_id)); const semanticRanks=bestRankByDay(admittedSemantic);
+  lexicalMatches.forEach((match,index)=>{if(lexicalRanks.get(match.shared_day_id)!==index+1)return;add(match,1/(rrfK+index+1),{anchor:true});});
+  admittedSemantic.forEach((match,index)=>{if(semanticRanks.get(match.shared_day_id)!==index+1)return;add(match,1/(rrfK+index+1));});
   return [...scores.values()].sort((left, right) => right.score - left.score);
 }
 
@@ -124,4 +106,4 @@ function formatSharedDayRecall({ dayKey, diary, annotations = [], messages = [],
   return blocks.join("\n\n");
 }
 
-module.exports = { SINGLE_CHINESE_BIGRAM_MIN_BM25, buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer };
+module.exports = { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer };

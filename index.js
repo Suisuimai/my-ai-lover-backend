@@ -1988,21 +1988,20 @@ async function querySourceRecallCandidates({userId,characterId,message,allowSema
   }
   return {
     terms,lexicalMatches,semanticMatches,embeddingModel:target?.model||null,
-    ranked:rankSharedDays({lexicalMatches,semanticMatches:semanticMatches.filter((item)=>admittedDays.has(item.shared_day_id)),queryTermCount:terms.length}),
+    ranked:rankSharedDays({lexicalMatches,semanticMatches:semanticMatches.filter((item)=>admittedDays.has(item.shared_day_id))}),
   };
 }
 
 async function recallSharedDay({userId,characterId,sessionId,message,allowSemantic=true,writePointer=true}) {
   const {terms,ranked}=await querySourceRecallCandidates({userId,characterId,message,allowSemantic}); if(!terms.length)return "";
-  let selected=null; let diary=null;
-  for(const candidate of ranked){const found=await loadConfirmedDiaryForDay(userId,characterId,candidate.sharedDayId);if(found){selected=candidate;diary=found;break;}}
+  let selected=ranked[0]||null; let diary=selected?await loadConfirmedDiaryForDay(userId,characterId,selected.sharedDayId):null;
   let pointer=null;
   if(!selected&&sessionId){const {data}=await supabase.from("memory_recall_pointers").select("*").eq("session_id",sessionId).eq("user_id",userId).eq("active",true).maybeSingle();pointer=data||null;if(pointer&&shouldContinueRecallPointer(message)){selected={sharedDayId:pointer.shared_day_id,anchorSourceMessageIds:pointer.anchor_source_message_ids,score:1};diary=await loadConfirmedDiaryForDay(userId,characterId,pointer.shared_day_id);}else if(pointer&&writePointer){await supabase.from("memory_recall_pointers").update({active:false,updated_at:new Date().toISOString()}).eq("session_id",sessionId).eq("user_id",userId);}}
-  if(!selected||!diary)return "本轮自动回忆检索没有找到达到可靠门槛且已经确认的旧事。不要拿相似但未达标的候选猜测，也不要假装已经想起来。";
+  if(!selected)return "本轮自动回忆检索没有找到带有真实字面证据的旧事。不要拿仅有语义相似但尚未标定的候选猜测，也不要假装已经想起来。";
   const [{data:day,error:dayError},{data:version,error:versionError},{data:annotations,error:annotationError}]=await Promise.all([
     supabase.from("shared_life_days").select("day_key").eq("id",selected.sharedDayId).eq("user_id",userId).single(),
     supabase.from("shared_life_day_versions").select("source_message_ids").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).order("revision_number",{ascending:false}).limit(1).single(),
-    supabase.from("diary_review_events").select("*").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).in("event_kind",["factual_note_added","relationship_note_added"]).order("created_at",{ascending:true}),
+    diary?supabase.from("diary_review_events").select("*").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).in("event_kind",["factual_note_added","relationship_note_added"]).order("created_at",{ascending:true}):Promise.resolve({data:[],error:null}),
   ]);
   if(dayError||versionError||annotationError)throw dayError||versionError||annotationError;
   const byId=new Map((await readAllOwnedSourceMessages(userId,characterId)).map((source)=>[source.id,source]));
@@ -2490,7 +2489,7 @@ app.post("/memory-index/test", async (req,res)=>{
     if(diaryStatusError)throw diaryStatusError; const confirmed=new Map();
     for(const entry of diaryStatuses||[])if(!confirmed.has(entry.shared_day_id))confirmed.set(entry.shared_day_id,entry.status==="confirmed");
     const bestByDay=(items,valueKey)=>{const seen=new Set();return items.filter((item)=>{if(seen.has(item.shared_day_id))return false;seen.add(item.shared_day_id);return true;}).slice(0,5).map((item)=>({dayKey:dayById.get(item.shared_day_id)||"未知日期",score:Number(item[valueKey]||0),confirmed:Boolean(confirmed.get(item.shared_day_id))}));};
-    const accepted=result.ranked.filter((item)=>confirmed.get(item.sharedDayId)).slice(0,5).map((item)=>({dayKey:dayById.get(item.sharedDayId)||"未知日期",score:item.score}));
+    const accepted=result.ranked.slice(0,5).map((item)=>({dayKey:dayById.get(item.sharedDayId)||"未知日期",score:item.score,confirmed:Boolean(confirmed.get(item.sharedDayId))}));
     res.json({success:true,test:{queryTerms:result.terms,embeddingModel:result.embeddingModel,lexical:bestByDay(result.lexicalMatches,"lexical_score"),semantic:bestByDay(result.semanticMatches,"similarity"),accepted,found:accepted.length>0}});
   }catch(error){res.status(error.status||500).json({success:false,error:error.message});}
 });
