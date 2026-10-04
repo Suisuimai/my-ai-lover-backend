@@ -42,14 +42,24 @@ function buildRetrievalWindows(corpus, { size = 6, stride = 3 } = {}) {
   return windows;
 }
 
+// Calibrated against the imported Chinese source corpus (2026-10-04):
+// 家教 ~= 4.38, 今天 ~= 2.41, 我们 ~= 2.83. Keep this fixed unless a
+// future corpus calibration deliberately replaces it with documented scores.
+const SINGLE_CHINESE_BIGRAM_MIN_BM25 = 3;
+
 function lexicalCandidateAccepted(match, queryTerms) {
   const matched = Number(match?.matched_terms || 0);
   const termCount = Math.max(1, new Set(queryTerms || []).size);
   const coverage = matched / termCount;
+  const score = Number(match?.lexical_score || 0);
+  const singleTerm = String(queryTerms?.[0] || "");
   const hasDistinctiveSingleTerm = termCount === 1 && String(queryTerms?.[0] || "").length >= 4;
+  const hasRareChineseBigram = termCount === 1
+    && /^[\p{Script=Han}]{2}$/u.test(singleTerm)
+    && score >= SINGLE_CHINESE_BIGRAM_MIN_BM25;
   const requiredMatches = termCount <= 3 ? 2 : Math.max(3, Math.ceil(termCount * 0.28));
-  return Number(match?.lexical_score || 0) > 0
-    && (hasDistinctiveSingleTerm || (matched >= requiredMatches && coverage >= 0.28));
+  return score > 0
+    && (hasDistinctiveSingleTerm || hasRareChineseBigram || (matched >= requiredMatches && coverage >= 0.28));
 }
 
 function rankSharedDays({ lexicalMatches = [], semanticMatches = [], queryTermCount = 1 }) {
@@ -114,4 +124,4 @@ function formatSharedDayRecall({ dayKey, diary, annotations = [], messages = [],
   return blocks.join("\n\n");
 }
 
-module.exports = { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer };
+module.exports = { SINGLE_CHINESE_BIGRAM_MIN_BM25, buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer };
