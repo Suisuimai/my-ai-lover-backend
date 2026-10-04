@@ -12,7 +12,23 @@ test("diary prompt fixes names, first-person voice, and documentary citations", 
   assert.match(prompt, /用户叫年妤/);
   assert.match(prompt, /Companion 指季疏/);
   assert.match(prompt, /evidence_message_numbers/);
+  assert.match(prompt, /压缩的是覆盖度，不是语气/);
+  assert.match(prompt, /连续中文叙事/);
+  assert.match(prompt, /不得写成 bullet/);
+  assert.match(prompt, /8–12 条/);
   assert.match(prompt, /M1/);
+});
+
+test("keeps narrative prose while bounding the hidden evidence layer",()=>{
+  const manyFacts=Array.from({length:20},(_,index)=>({text:`事实${index}`,evidence_message_numbers:[1,2,1],evidence_quotes:["今天第51天","七点下班","多余引语"]}));
+  const manyFeelings=Array.from({length:9},(_,index)=>({text:`感受${index}`,evidence_message_numbers:[2]}));
+  const diary=parseGroundedDiary(JSON.stringify({title:"一天",body_markdown:"我和妤妤说了一整天的话。".repeat(200),current_state:"还想继续聊。".repeat(50),facts:manyFacts,feelings:manyFeelings}),source);
+  assert.equal(diary.facts.length,12);
+  assert.equal(diary.feelings.length,5);
+  assert.equal(diary.facts[0].evidenceNumbers.length,2);
+  assert.equal(diary.facts[0].evidenceQuotes.length,1);
+  assert.ok(diary.bodyMarkdown.length<=1500);
+  assert.ok(diary.currentState.length<=150);
 });
 
 test("accepts grounded facts and permanently labels feelings", () => {
