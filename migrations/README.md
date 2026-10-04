@@ -18,6 +18,6 @@ blindly: the security migration intentionally deletes legacy demo sessions.
 The first V2 migration will bind existing sessions to a default character
 without deleting messages or `session_memories`.
 
-Current latest migration: `027_diary_job_diagnostics.sql`, which adds safe structured failure
-stages, the requested model, and source-message counts to asynchronous diary jobs without
-storing raw provider errors or conversation content.
+Current latest migration: `028_stream_completion_status.sql`, which records model stream
+terminal states, keeps truncated assistant output visible without rewriting it, and links any
+later continuation as a separate message.

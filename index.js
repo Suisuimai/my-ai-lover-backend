@@ -54,6 +54,7 @@ const {
   parseSupportExtraction,
 } = require("./core/memoryPractice");
 const { apiErrorCode, normalizeModelUsage } = require("./core/apiUsage");
+const { normalizeCompletion, readModelEventStream } = require("./core/modelStream");
 const {
   API_FORMATS,
   FEATURE_DEFINITIONS,
@@ -292,44 +293,7 @@ async function recordModelUsage(event) {
   }
 }
 
-async function readModelEventStream(response, { providerType, onDelta }) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let text = "";
-  let finalData = {};
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split("\n\n");
-    buffer = events.pop() || "";
-    for (const event of events) {
-      for (const line of event.split("\n")) {
-        if (!line.startsWith("data:")) continue;
-        const raw = line.slice(5).trim();
-        if (!raw || raw === "[DONE]") continue;
-        let data;
-        try { data = JSON.parse(raw); } catch { continue; }
-        finalData = data.usage ? { ...finalData, ...data } : finalData;
-        const delta = providerType === "anthropic"
-          ? (data.type === "content_block_delta" ? data.delta?.text : "")
-          : data.choices?.[0]?.delta?.content;
-        if (delta) {
-          text += delta;
-          onDelta(delta, text);
-        }
-        if (providerType === "anthropic" && data.type === "message_start") finalData = data.message || finalData;
-        if (providerType === "anthropic" && data.type === "message_delta") {
-          finalData = { ...finalData, usage: { ...(finalData.usage || {}), ...(data.usage || {}) } };
-        }
-      }
-    }
-  }
-  return { text: text.trim(), data: finalData };
-}
-
-async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, signal, preparationMs = null }) {
+async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, onCompletion, signal, preparationMs = null }) {
   const startedAt = new Date();
   const startedClock = Date.now();
   let provider;
@@ -340,6 +304,7 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
   let resolvedModel = null;
   let providerRequestId = null;
   let firstTokenMs = null;
+  let completion = null;
 
   try {
     provider = await getModelTarget({ userId, purpose, legacyModel: model });
@@ -377,9 +342,11 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
           onDelta(delta, complete);
         } });
         responseData = streamed.data;
+        completion = streamed.completion;
+        onCompletion?.(completion);
         const text = streamed.text;
         if (!text) { errorCode = "empty_reply"; throw new Error(`${provider.name} returned an empty streamed reply`); }
-        status = "succeeded";
+        status = completion.complete ? "succeeded" : "truncated";
         resolvedModel = responseData.model || model;
         providerRequestId = responseData.id || response.headers.get("x-request-id");
         return text;
@@ -389,6 +356,8 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
       if (!response.ok) throw new Error(responseData.error?.message || `${provider.name} request failed`);
       const text = responseData.choices?.[0]?.message?.content?.trim();
       const finishReason = responseData.choices?.[0]?.finish_reason || "unknown";
+      completion = normalizeCompletion(provider.type, finishReason, Boolean(responseData.choices?.[0]?.finish_reason));
+      onCompletion?.(completion);
       if (responseFormat && finishReason === "length") {
         errorCode = "incomplete_structured_reply";
         throw new Error(`${provider.name} returned an incomplete structured reply`);
@@ -397,7 +366,7 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
         errorCode = "empty_reply";
         throw new Error(`${provider.name} returned an empty reply (finish_reason: ${finishReason})`);
       }
-      status = "succeeded";
+      status = completion.complete ? "succeeded" : "truncated";
       errorCode = null;
       resolvedModel = responseData.model || model;
       providerRequestId = responseData.id || response.headers.get("x-request-id");
@@ -437,9 +406,11 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
         onDelta(delta, complete);
       } });
       responseData = streamed.data;
+      completion = streamed.completion;
+      onCompletion?.(completion);
       const text = streamed.text;
       if (!text) { errorCode = "empty_reply"; throw new Error("Anthropic returned an empty streamed reply"); }
-      status = "succeeded";
+      status = completion.complete ? "succeeded" : "truncated";
       resolvedModel = responseData.model || model;
       providerRequestId = responseData.id || response.headers.get("request-id");
       return text;
@@ -448,11 +419,13 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
     errorCode = apiErrorCode(responseData, response.status);
     if (!response.ok) throw new Error(responseData.error?.message || "Anthropic request failed");
     const text = responseData.content?.filter((part) => part.type === "text").map((part) => part.text).join("").trim();
+    completion = normalizeCompletion(provider.type, responseData.stop_reason, Boolean(responseData.stop_reason));
+    onCompletion?.(completion);
     if (!text) {
       errorCode = "empty_reply";
       throw new Error("Anthropic returned an empty reply");
     }
-    status = "succeeded";
+    status = completion.complete ? "succeeded" : "truncated";
     errorCode = null;
     resolvedModel = responseData.model || model;
     providerRequestId = responseData.id || response.headers.get("request-id");
@@ -494,6 +467,8 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
         preparation_ms: Number.isFinite(preparationMs) ? Math.max(0, Math.trunc(preparationMs)) : null,
         first_token_ms: firstTokenMs,
         provider_request_id: providerRequestId,
+        completion_status: completion?.status || null,
+        finish_reason: completion?.finishReason || null,
         started_at: startedAt.toISOString(),
         completed_at: new Date().toISOString(),
         provider_usage: usage.providerUsage,
@@ -1827,7 +1802,7 @@ async function readVisibleMessages(sessionId, userId) {
   await requireOwnedSession(sessionId, userId);
   const { data, error } = await supabase
     .from("messages")
-    .select("id, session_id, role, content, is_visible, context_status, replaces_message_id, created_at")
+    .select("id, session_id, role, content, is_visible, context_status, replaces_message_id, generation_status, finish_reason, continues_message_id, created_at")
     .eq("session_id", sessionId)
     .eq("is_visible", true)
     .order("created_at", { ascending: true });
@@ -3169,7 +3144,7 @@ app.get("/api-usage-events", async (req, res) => {
     const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? requestedLimit : 30));
     const periodStarts = shanghaiPeriodStarts();
     const { data, error } = await supabase.from("api_usage_events")
-      .select("id,purpose,provider,requested_model,resolved_model,status,input_tokens,output_tokens,total_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,provider_cost,cost_currency,cost_source,duration_ms,preparation_ms,first_token_ms,started_at")
+      .select("id,purpose,provider,requested_model,resolved_model,status,completion_status,finish_reason,input_tokens,output_tokens,total_tokens,cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,provider_cost,cost_currency,cost_source,duration_ms,preparation_ms,first_token_ms,started_at")
       .eq("user_id", req.user.id)
       .gte("started_at", periodStarts.month.toISOString())
       .order("started_at", { ascending: false })
@@ -3218,6 +3193,8 @@ app.get("/api-usage-events", async (req, res) => {
         requestedModel: event.requested_model,
         resolvedModel: event.resolved_model,
         status: event.status,
+        completionStatus: event.completion_status,
+        finishReason: event.finish_reason,
         inputTokens: event.input_tokens || 0,
         outputTokens: event.output_tokens || 0,
         totalTokens: event.total_tokens || 0,
@@ -3486,19 +3463,22 @@ function validUuid(value) {
 
 async function completedChatRequestResponse(request, userId) {
   const [{ data: assistant, error: assistantError }, { data: session, error: sessionError }] = await Promise.all([
-    supabase.from("messages").select("id,content").eq("id", request.assistant_message_id).maybeSingle(),
+    supabase.from("messages").select("id,content,generation_status,finish_reason,continues_message_id").eq("id", request.assistant_message_id).maybeSingle(),
     supabase.from("sessions").select("id,name").eq("id", request.session_id).eq("user_id", userId).maybeSingle(),
   ]);
   if (assistantError || sessionError) throw assistantError || sessionError;
   if (!assistant || !session) throw new Error("Completed chat result is no longer available");
   return {
     success: true,
-    requestStatus: "succeeded",
+    requestStatus: request.status,
     clientRequestId: request.id,
     sessionId: session.id,
     title: session.name,
     reply: assistant.content,
     messageId: assistant.id,
+    generationStatus: assistant.generation_status,
+    finishReason: assistant.finish_reason,
+    continuesMessageId: assistant.continues_message_id,
     recovered: true,
   };
 }
@@ -3510,7 +3490,7 @@ app.get("/chat-requests/:requestId", async (req, res) => {
       .eq("id", req.params.requestId).eq("user_id", req.user.id).maybeSingle();
     if (error) throw error;
     if (!request) return res.status(404).json({ success: false, error: "Chat request not found" });
-    if (request.status === "succeeded") return res.json(await completedChatRequestResponse(request, req.user.id));
+    if (["succeeded","truncated"].includes(request.status)) return res.json(await completedChatRequestResponse(request, req.user.id));
     res.json({ success: true, requestStatus: request.status, clientRequestId: request.id, sessionId: request.session_id });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -3542,12 +3522,13 @@ app.post("/chat", async (req, res) => {
   if (!validUuid(clientRequestId)) return res.status(400).json({ success: false, error: "A valid clientRequestId is required" });
 
   const wantsStream = req.headers.accept?.includes("text/event-stream");
-  const operation = ["send", "regenerate", "edit"].includes(req.body.operation) ? req.body.operation : "send";
+  const operation = ["send", "regenerate", "edit", "continue"].includes(req.body.operation) ? req.body.operation : "send";
   const targetMessageId = req.body.targetMessageId;
   const abortController = new AbortController();
   let trackedRequest = null;
   let streamedReply = "";
   let streamClosed = false;
+  let modelCompletion = { complete: false, status: "unknown", finishReason: null };
   const sendStreamEvent = (event, data) => {
     if (!wantsStream || res.writableEnded || res.destroyed) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -3569,7 +3550,7 @@ app.post("/chat", async (req, res) => {
       }
       return res.status(409).json({ success: false, error: "This retry ID belongs to different text" });
     }
-    if (existingRequest?.status === "succeeded") {
+    if (["succeeded","truncated"].includes(existingRequest?.status)) {
       const completed = await completedChatRequestResponse(existingRequest, req.user.id);
       if (wantsStream) {
         sendStreamEvent("done", completed);
@@ -3634,7 +3615,7 @@ app.post("/chat", async (req, res) => {
         if (discardError) throw discardError;
         trackedRequest.user_message_id = target.id;
         await supabase.from("chat_requests").update({ user_message_id: target.id }).eq("id", clientRequestId);
-      } else {
+      } else if (operation === "regenerate") {
         const { error: alternativeError } = await supabase.from("messages").update({ context_status: "alternative" }).eq("id", target.id);
         if (alternativeError) throw alternativeError;
         const { data: precedingUser, error: precedingError } = await supabase.from("messages").select("id")
@@ -3736,6 +3717,12 @@ app.post("/chat", async (req, res) => {
       memorySummary,
       recentMessages: historyChronological,
     });
+    if (operation === "continue") {
+      context.splice(Math.max(0, context.length - historyChronological.length), 0, {
+        role: "system",
+        content: "The immediately preceding assistant message was cut off by the transport or output limit. Continue that reply naturally from where it stopped. Do not repeat or rewrite the existing partial message; produce only the continuation as a new assistant message.",
+      });
+    }
 
     const requestedModel = typeof req.body.model === "string" && req.body.model.trim()
       ? req.body.model.trim()
@@ -3755,7 +3742,13 @@ app.post("/chat", async (req, res) => {
           streamedReply = complete;
           sendStreamEvent("delta", { delta });
         } : undefined,
+        onCompletion: (value) => { modelCompletion = value; },
       });
+
+    const generationStatus = modelCompletion.complete
+      ? "complete"
+      : modelCompletion.status === "length" ? "truncated_length"
+        : modelCompletion.status === "abnormal_eof" ? "truncated_eof" : "truncated_unknown";
 
     const { data: assistantMessage, error: assistantMessageError } = await supabase
       .from("messages")
@@ -3765,6 +3758,9 @@ app.post("/chat", async (req, res) => {
         content: reply,
         is_visible: true,
         context_status: "active",
+        generation_status: generationStatus,
+        finish_reason: modelCompletion.finishReason,
+        ...(operation === "continue" ? { continues_message_id: targetMessageId } : {}),
         ...(operation === "regenerate" ? { replaces_message_id: targetMessageId } : {}),
       })
       .select()
@@ -3819,7 +3815,7 @@ app.post("/chat", async (req, res) => {
     }
 
     const { error: requestUpdateError } = await supabase.from("chat_requests").update({
-      status: "succeeded",
+      status: modelCompletion.complete ? "succeeded" : "truncated",
       assistant_message_id: assistantMessage.id,
       completed_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -3843,9 +3839,11 @@ app.post("/chat", async (req, res) => {
       followUpStatusSuggestion,
       operation,
       targetMessageId: targetMessageId || null,
+      generationStatus,
+      finishReason: modelCompletion.finishReason,
     };
     if (wantsStream) {
-      sendStreamEvent("done", responsePayload);
+      sendStreamEvent(modelCompletion.complete ? "done" : "truncated", responsePayload);
       streamClosed = true;
       res.end();
     } else {
@@ -3868,6 +3866,7 @@ app.post("/chat", async (req, res) => {
             content: streamedReply.trim(),
             is_visible: true,
             context_status: "active",
+            generation_status: "stopped",
             ...(operation === "regenerate" ? { replaces_message_id: targetMessageId } : {}),
           }).select("id").single();
           if (partialInsertError) throw partialInsertError;
