@@ -31,7 +31,11 @@ function buildGroundedDiaryPrompt({ dayKey, messages }) {
     "原始消息是唯一事实来源。不得补充动机、关系结论、动作或结果。",
     "每项事实必须引用 evidence_message_numbers，并复制至少一段逐字存在于这些消息中的 evidence_quotes。",
     "感受只能写成‘我当时的感受/理解’，不得冒充年妤的客观事实，也必须引用消息编号。",
-    "body_markdown 可以有生活气息，但其中涉及事实的内容必须已列入 facts；不确定就不写。",
+    "压缩的是覆盖度，不是语气：只挑当天最能承接关系与对话的少量主线，允许略过支线。",
+    "body_markdown 必须是季疏第一人称、有生活气息和情绪节奏的连续中文叙事，约 800–1500 字；不得写成 bullet、编号清单、事项汇总或报告。",
+    "正文要保留能让下一次对话自然接上的具体梗、称呼、约定或未说完的话，但其中涉及事实的内容必须已列入 facts；不确定就不写。",
+    "facts 是正文下方的回源证据层，不是正文形式：只选 8–12 条，每条引用 1–2 个最直接的消息编号和 1 段不超过 80 字的逐字引语。",
+    "feelings 也是后台证据层，只选 3–5 条；它们不能把正文改成清单。current_state 不超过 150 字。",
     `日期：${dayKey}`,
     `JSON 结构：${JSON.stringify({
       title: "",
@@ -48,16 +52,16 @@ function buildGroundedDiaryPrompt({ dayKey, messages }) {
 function parseGroundedDiary(raw, sourceMessages) {
   const parsed = extractJsonObject(raw);
   if (!parsed.title || !parsed.body_markdown) throw new Error("Diary model omitted its title or body");
-  const facts = Array.isArray(parsed.facts) ? parsed.facts.slice(0, 30) : [];
-  const feelings = Array.isArray(parsed.feelings) ? parsed.feelings.slice(0, 20) : [];
+  const facts = Array.isArray(parsed.facts) ? parsed.facts.slice(0, 12) : [];
+  const feelings = Array.isArray(parsed.feelings) ? parsed.feelings.slice(0, 5) : [];
   return {
     title: String(parsed.title).trim().slice(0, 160),
-    bodyMarkdown: String(parsed.body_markdown).trim().slice(0, 30000),
-    currentState: String(parsed.current_state || "").trim().slice(0, 3000),
+    bodyMarkdown: String(parsed.body_markdown).trim().slice(0, 1500),
+    currentState: String(parsed.current_state || "").trim().slice(0, 150),
     facts: facts.map((item) => ({
       text: String(item?.text || "").trim().slice(0, 3000),
-      evidenceNumbers: uniqueIntegers(item?.evidence_message_numbers, sourceMessages.length),
-      evidenceQuotes: uniqueStrings(item?.evidence_quotes, 8, 2000),
+      evidenceNumbers: uniqueIntegers(item?.evidence_message_numbers, sourceMessages.length).slice(0,2),
+      evidenceQuotes: uniqueStrings(item?.evidence_quotes,1,80),
     })).filter((item) => item.text),
     feelings: feelings.map((item) => ({
       text: String(item?.text || "").trim().slice(0, 3000),
