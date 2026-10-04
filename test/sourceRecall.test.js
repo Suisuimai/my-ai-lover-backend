@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { SINGLE_CHINESE_BIGRAM_MIN_BM25, buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("../core/sourceRecall");
+const { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("../core/sourceRecall");
 
 test("lexical coordinates keep raw Chinese meaning searchable without summaries", () => {
   const terms = lexicalTerms("那次英语补考，Morning intimacy");
@@ -9,14 +9,14 @@ test("lexical coordinates keep raw Chinese meaning searchable without summaries"
   assert.ok(terms.includes("morning"));
 });
 
-test("hybrid ranking combines lexical and semantic coordinates by shared day", () => {
+test("RRF combines lexical and semantic ranks without admitting semantic-only days", () => {
   const ranked = rankSharedDays({
     lexicalMatches:[{shared_day_id:"d1",source_message_id:"m1",matched_terms:3,lexical_score:8}],
     semanticMatches:[{shared_day_id:"d2",source_message_id:"m2",similarity:.95},{shared_day_id:"d1",source_message_id:"m3",similarity:.7}],
-    queryTermCount:4,
   });
   assert.equal(ranked[0].sharedDayId,"d1");
-  assert.deepEqual(ranked[0].anchorSourceMessageIds,["m1","m3"]);
+  assert.deepEqual(ranked[0].anchorSourceMessageIds,["m1"]);
+  assert.equal(ranked.some((item)=>item.sharedDayId==="d2"),false);
 });
 
 test("large days disclose partial source reading", () => {
@@ -43,29 +43,16 @@ test("retrieval windows contain only adjacent exact source text and ids",()=>{
   assert.deepEqual(windows[1].sourceMessageIds,["m3","m4","m5","m6","m7"]);
 });
 
-test("lexical admission uses evidence coverage and permits a true zero-result",()=>{
+test("every real lexical hit enters the candidate ranking",()=>{
   const terms=retrievalQueryTerms("你还记得英语补考吗");
-  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:9},terms),false);
+  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:.01},terms),true);
   assert.equal(lexicalCandidateAccepted({matched_terms:Math.ceil(terms.length*.4),lexical_score:2},terms),true);
-});
-
-test("a rare exact Chinese bigram passes the calibrated BM25 boundary",()=>{
-  const terms=retrievalQueryTerms("家教");
-  assert.deepEqual(terms,["家教"]);
-  assert.equal(SINGLE_CHINESE_BIGRAM_MIN_BM25,3);
-  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:4.383},terms),true);
-  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:2.999},terms),false);
-});
-
-test("common exact Chinese bigrams do not pass merely because they occur",()=>{
-  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:2.410},retrievalQueryTerms("今天")),false);
-  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:2.830},retrievalQueryTerms("我们")),false);
-});
-
-test("an invented Chinese query still admits zero candidates",()=>{
-  const terms=retrievalQueryTerms("麒麟陀螺");
   assert.equal(lexicalCandidateAccepted({matched_terms:0,lexical_score:0},terms),false);
-  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:8},terms),false);
+});
+
+test("common terms may enter candidates but remain subject to BM25 and RRF ranking",()=>{
+  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:2.410},retrievalQueryTerms("今天")),true);
+  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:2.830},retrievalQueryTerms("我们")),true);
 });
 
 test("source range disclosure comes after exact messages",()=>{
