@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("../core/sourceRecall");
+const { SINGLE_CHINESE_BIGRAM_MIN_BM25, buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("../core/sourceRecall");
 
 test("lexical coordinates keep raw Chinese meaning searchable without summaries", () => {
   const terms = lexicalTerms("那次英语补考，Morning intimacy");
@@ -47,6 +47,25 @@ test("lexical admission uses evidence coverage and permits a true zero-result",(
   const terms=retrievalQueryTerms("你还记得英语补考吗");
   assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:9},terms),false);
   assert.equal(lexicalCandidateAccepted({matched_terms:Math.ceil(terms.length*.4),lexical_score:2},terms),true);
+});
+
+test("a rare exact Chinese bigram passes the calibrated BM25 boundary",()=>{
+  const terms=retrievalQueryTerms("家教");
+  assert.deepEqual(terms,["家教"]);
+  assert.equal(SINGLE_CHINESE_BIGRAM_MIN_BM25,3);
+  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:4.383},terms),true);
+  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:2.999},terms),false);
+});
+
+test("common exact Chinese bigrams do not pass merely because they occur",()=>{
+  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:2.410},retrievalQueryTerms("今天")),false);
+  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:2.830},retrievalQueryTerms("我们")),false);
+});
+
+test("an invented Chinese query still admits zero candidates",()=>{
+  const terms=retrievalQueryTerms("麒麟陀螺");
+  assert.equal(lexicalCandidateAccepted({matched_terms:0,lexical_score:0},terms),false);
+  assert.equal(lexicalCandidateAccepted({matched_terms:1,lexical_score:8},terms),false);
 });
 
 test("source range disclosure comes after exact messages",()=>{
