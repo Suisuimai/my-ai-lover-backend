@@ -36,9 +36,10 @@ const {
 const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } = require("./core/timeline");
 const { buildHandoffPrompt, formatWindowContinuity, parseHandoffCandidate } = require("./core/handoff");
 const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
-const { groupSourceMessagesBySharedDay } = require("./core/sharedDays");
+const { groupSourceMessagesBySharedDay, hasMorningMarker, hasNightMarker } = require("./core/sharedDays");
 const { buildGroundedDiaryPrompt, parseGroundedDiary, validateGroundedDiary } = require("./core/groundedDiary");
 const { applyDiaryReview, cleanText, reviewEventForAction } = require("./core/diaryReview");
+const { classifyDiaryGenerationError } = require("./core/diaryFailures");
 const { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("./core/sourceRecall");
 const {
   buildExperienceExtractionPrompt,
@@ -456,6 +457,12 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
     resolvedModel = responseData.model || model;
     providerRequestId = responseData.id || response.headers.get("request-id");
     return text;
+  } catch (error) {
+    error.modelFailure = {
+      code: errorCode || null,
+      httpStatus: response?.status || null,
+    };
+    throw error;
   } finally {
     if (userId) {
       const usage = normalizeModelUsage(provider?.name, responseData);
@@ -1129,6 +1136,7 @@ app.post("/timeline-imports", async (req, res) => {
     })));
     const { error: sourceError } = await supabase.from("source_messages").insert(sourceRows);
     if (sourceError) throw sourceError;
+    setImmediate(()=>rebuildSharedLifeDays(req.user.id,character.id).catch((reason)=>console.error("Imported shared-day refresh failed:",reason.message)));
     res.status(201).json({ success: true, import: data, segments: savedSegments });
   } catch (error) {
     if (createdImport?.id) await supabase.from("conversation_imports").delete().eq("id", createdImport.id).eq("user_id", req.user.id);
@@ -1917,14 +1925,17 @@ async function sourceRetrievalWindows(userId, characterId) {
 }
 
 async function sourceIndexStatus(userId,characterId) {
-  const windows=await sourceRetrievalWindows(userId,characterId); const target=await getEmbeddingTarget(userId).catch(()=>null);
-  if(!windows.length)return {sourceCount:0,windowCount:0,lexicalCount:0,embeddingCount:0,embeddingConfigured:Boolean(target),embeddingModel:target?.model||null,indexVersion:"raw-turn-window-v1"};
-  const currentKeys=new Set(windows.map((window)=>window.windowKey));
-  const indexedWindows=await readIndexRows("source_retrieval_windows","id,window_key","id",userId,characterId,{algorithm_version:"raw-turn-window-v1"});
-  const currentWindowIds=new Set(indexedWindows.filter((window)=>currentKeys.has(window.window_key)).map((window)=>window.id));
-  const embeddingRows=target?await readIndexRows("source_retrieval_window_embeddings","window_id","window_id",userId,characterId,{model_id:target.model}):[];
-  const embeddingCount=embeddingRows.filter((item)=>currentWindowIds.has(item.window_id)).length;
-  return {sourceCount:windows.length,windowCount:windows.length,lexicalCount:currentWindowIds.size,embeddingCount,embeddingConfigured:Boolean(target),embeddingModel:target?.model||null,indexVersion:"raw-turn-window-v1"};
+  const target=await getEmbeddingTarget(userId).catch(()=>null);
+  const lexicalQuery=supabase.from("source_retrieval_windows").select("id",{count:"exact",head:true})
+    .eq("user_id",userId).eq("character_id",characterId).eq("algorithm_version","raw-turn-window-v1");
+  const embeddingQuery=target
+    ? supabase.from("source_retrieval_window_embeddings").select("id",{count:"exact",head:true})
+      .eq("user_id",userId).eq("character_id",characterId).eq("model_id",target.model)
+    : Promise.resolve({count:0,error:null});
+  const [lexical,embedding]=await Promise.all([lexicalQuery,embeddingQuery]);
+  if(lexical.error||embedding.error)throw lexical.error||embedding.error;
+  const lexicalCount=Number(lexical.count||0); const embeddingCount=Number(embedding.count||0);
+  return {sourceCount:lexicalCount,windowCount:lexicalCount,lexicalCount,embeddingCount,embeddingConfigured:Boolean(target),embeddingModel:target?.model||null,indexVersion:"raw-turn-window-v1"};
 }
 
 async function buildSourceIndexBatch(userId,characterId,{includeEmbeddings=true,embeddingLimit=96}={}) {
@@ -2017,26 +2028,22 @@ app.get("/diary/shared-days", async (req, res) => {
   }
 });
 
-app.post("/diary/shared-days/rebuild", async (req, res) => {
-  try {
-    const character = req.body.characterId
-      ? await getOwnedCharacter(req.body.characterId, req.user.id)
-      : await getOrCreateDefaultCharacter(req.user.id);
-    const grouped = groupSourceMessagesBySharedDay(await readAllOwnedSourceMessages(req.user.id, character.id));
+async function rebuildSharedLifeDays(userId,characterId) {
+    const grouped = groupSourceMessagesBySharedDay(await readAllOwnedSourceMessages(userId,characterId));
     let appendedVersions = 0;
     for (const group of grouped) {
       let { data: day, error: dayError } = await supabase.from("shared_life_days").select("*")
-        .eq("user_id", req.user.id).eq("character_id", character.id).eq("day_key", group.dayKey).maybeSingle();
+        .eq("user_id",userId).eq("character_id",characterId).eq("day_key", group.dayKey).maybeSingle();
       if (dayError) throw dayError;
       if (!day) {
         const inserted = await supabase.from("shared_life_days").insert({
-          user_id: req.user.id, character_id: character.id, day_key: group.dayKey,
+          user_id:userId,character_id:characterId,day_key:group.dayKey,
         }).select().single();
         if (inserted.error) throw inserted.error;
         day = inserted.data;
       }
       const { data: previous, error: previousError } = await supabase.from("shared_life_day_versions").select("*")
-        .eq("shared_day_id", day.id).eq("user_id", req.user.id)
+        .eq("shared_day_id", day.id).eq("user_id",userId)
         .order("revision_number", { ascending: false }).limit(1).maybeSingle();
       if (previousError) throw previousError;
       const sameSources = previous
@@ -2049,7 +2056,7 @@ app.post("/diary/shared-days/rebuild", async (req, res) => {
         && previous.night_marker_source_id === group.nightMarkerSourceId));
       if (unchanged) continue;
       const { error: versionError } = await supabase.from("shared_life_day_versions").insert({
-        shared_day_id: day.id, user_id: req.user.id, character_id: character.id,
+        shared_day_id:day.id,user_id:userId,character_id:characterId,
         revision_number: previous ? previous.revision_number + 1 : 0,
         started_at: group.startedAt, ended_at: group.endedAt,
         source_message_ids: group.sourceMessageIds,
@@ -2063,7 +2070,15 @@ app.post("/diary/shared-days/rebuild", async (req, res) => {
       if (versionError) throw versionError;
       appendedVersions += 1;
     }
-    res.json({ success: true, discoveredDays: grouped.length, appendedVersions });
+    return {discoveredDays:grouped.length,appendedVersions};
+}
+
+app.post("/diary/shared-days/rebuild", async (req, res) => {
+  try {
+    const character = req.body.characterId
+      ? await getOwnedCharacter(req.body.characterId, req.user.id)
+      : await getOrCreateDefaultCharacter(req.user.id);
+    res.json({success:true,...await rebuildSharedLifeDays(req.user.id,character.id)});
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });
   }
@@ -2109,9 +2124,10 @@ async function processDiaryGenerationJob(jobId) {
   if (!job || job.status !== "queued") return;
   const startedAt = new Date().toISOString();
   const { error: runningError } = await supabase.from("diary_generation_jobs").update({
-    status: "running", started_at: startedAt, updated_at: startedAt, error_code: null,
+    status: "running", started_at: startedAt, updated_at: startedAt, error_code: null, failure_stage: null,
   }).eq("id", job.id).eq("status", "queued");
   if (runningError) throw runningError;
+  let failureStage = "source_read";
   try {
     const [{ data: day, error: dayError }, { data: version, error: versionError }] = await Promise.all([
       supabase.from("shared_life_days").select("*").eq("id", job.shared_day_id).eq("user_id", job.user_id).maybeSingle(),
@@ -2126,6 +2142,11 @@ async function processDiaryGenerationJob(jobId) {
     }));
     if (sourceMessages.length !== version.source_message_ids.length) throw new Error("A diary source message is missing");
     const settings = await getSettings(job.user_id);
+    const target = await getModelTarget({ userId:job.user_id, purpose:"diary_generation", legacyModel:settings.summary_model });
+    await supabase.from("diary_generation_jobs").update({
+      requested_model:target.model, source_message_count:sourceMessages.length, updated_at:new Date().toISOString(),
+    }).eq("id",job.id);
+    failureStage = "model_request";
     const raw = await callModel({
       purpose: "diary_generation", model: settings.summary_model, userId: job.user_id,
       sessionId: job.shared_day_id, temperature: 0.2, maxTokens: 7000, responseFormat: "json_object", thinking: "disabled",
@@ -2134,7 +2155,9 @@ async function processDiaryGenerationJob(jobId) {
         { role: "user", content: buildGroundedDiaryPrompt({ dayKey: day.day_key, messages: sourceMessages }) },
       ],
     });
+    failureStage = "model_parse";
     const diary = parseGroundedDiary(raw, sourceMessages);
+    failureStage = "validation";
     const validation = validateGroundedDiary(diary, sourceMessages, { dayKey: day.day_key });
     const importedDraft = sourceMessages.some((message) => message.source_kind === "claude_import");
     if (importedDraft && !validation.issues.some((issue) => issue.kind === "imported_draft")) {
@@ -2145,6 +2168,7 @@ async function processDiaryGenerationJob(jobId) {
     }
     const status = validation.issues.length ? "needs_review" : "confirmed";
     const entryId = crypto.randomUUID();
+    failureStage = "storage";
     const { error: saveError } = await supabase.rpc("save_grounded_diary", {
       p_entry_id: entryId, p_user_id: job.user_id, p_character_id: job.character_id,
       p_shared_day_id: day.id, p_shared_day_version_id: version.id, p_generation_job_id: job.id,
@@ -2168,20 +2192,10 @@ async function processDiaryGenerationJob(jobId) {
     const completedAt = new Date().toISOString();
     await supabase.from("diary_generation_jobs").update({
       status: "failed", completed_at: completedAt, updated_at: completedAt,
-      error_code: classifyDiaryGenerationError(error),
+      error_code: classifyDiaryGenerationError(error, failureStage), failure_stage:failureStage,
     }).eq("id", job.id);
     console.error("Diary generation failed:", error);
   }
-}
-
-function classifyDiaryGenerationError(error) {
-  if (error?.code) return String(error.code).slice(0, 120);
-  const message = String(error?.message || "").toLowerCase();
-  if (message.includes("empty reply") || message.includes("empty response")) return "empty_reply";
-  if (message.includes("finish_reason: length") || message.includes("maximum context") || message.includes("max_tokens")) return "output_length";
-  if (message.includes("json") || message.includes("diary model") || message.includes("omitted its title")) return "invalid_json";
-  if (message.includes("source message is missing")) return "source_message_missing";
-  return "diary_generation_failed";
 }
 
 function startDiaryJob(jobId) {
@@ -2215,10 +2229,28 @@ async function createDiaryJobForLatestVersion({ userId, characterId, sharedDayId
   if (countError) throw countError;
   const { data: job, error: insertError } = await supabase.from("diary_generation_jobs").insert({
     user_id: userId, character_id: characterId, shared_day_id: day.id, shared_day_version_id: version.id,
-    attempt_number: Number(count || 0) + 1,
+    attempt_number: Number(count || 0) + 1, source_message_count:(version.source_message_ids||[]).length,
   }).select().single();
   if (insertError) throw insertError;
   return { job, created: true };
+}
+
+async function refreshSharedDaysAfterMarker(userId,characterId) {
+  await rebuildSharedLifeDays(userId,characterId);
+  const {data:days,error:dayError}=await supabase.from("shared_life_days").select("*")
+    .eq("user_id",userId).eq("character_id",characterId).order("day_key",{ascending:false}).limit(10);
+  if(dayError)throw dayError;
+  const versions=await latestSharedDayVersions((days||[]).map((day)=>day.id),userId);
+  const [{data:entries,error:entryError},{data:jobs,error:jobError}]=await Promise.all([
+    supabase.from("diary_entries").select("shared_day_id").eq("user_id",userId).eq("character_id",characterId),
+    supabase.from("diary_generation_jobs").select("shared_day_id").eq("user_id",userId).eq("character_id",characterId),
+  ]);
+  if(entryError||jobError)throw entryError||jobError;
+  const used=new Set([...(entries||[]).map((item)=>item.shared_day_id),...(jobs||[]).map((item)=>item.shared_day_id)]);
+  const candidate=(days||[]).find((day)=>versions.get(day.id)?.boundary_state==="sealed"&&!used.has(day.id));
+  if(!candidate)return;
+  const result=await createDiaryJobForLatestVersion({userId,characterId,sharedDayId:candidate.id});
+  if(result.created)startDiaryJob(result.job.id);
 }
 
 app.post("/diary/backfill-sample", async (req, res) => {
@@ -3782,6 +3814,9 @@ app.post("/chat", async (req, res) => {
       error_code: null,
     }).eq("id", clientRequestId).eq("user_id", req.user.id);
     if (requestUpdateError) console.error("Chat request completion tracking failed:", requestUpdateError);
+    if(operation==="send"&&(hasMorningMarker(message)||hasNightMarker(message))){
+      setImmediate(()=>refreshSharedDaysAfterMarker(req.user.id,character.id).catch((reason)=>console.error("Marker shared-day refresh failed:",reason.message)));
+    }
 
     const responsePayload = {
       success: true,
