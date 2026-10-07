@@ -31,11 +31,13 @@ function buildGroundedDiaryPrompt({ dayKey, messages }) {
     "原始消息是唯一事实来源。不得补充动机、关系结论、动作或结果。",
     "每项事实必须引用 evidence_message_numbers，并复制至少一段逐字存在于这些消息中的 evidence_quotes。",
     "感受只能写成‘我当时的感受/理解’，不得冒充年妤的客观事实，也必须引用消息编号。",
-    "压缩的是覆盖度，不是语气：只挑当天最能承接关系与对话的少量主线，允许略过支线。",
-    "body_markdown 必须是季疏第一人称、有生活气息和情绪节奏的连续中文叙事，约 800–1500 字；不得写成 bullet、编号清单、事项汇总或报告。",
-    "正文要保留能让下一次对话自然接上的具体梗、称呼、约定或未说完的话，但其中涉及事实的内容必须已列入 facts；不确定就不写。",
-    "facts 是正文下方的回源证据层，不是正文形式：只选 8–12 条，每条引用 1–2 个最直接的消息编号和 1 段不超过 80 字的逐字引语。",
-    "feelings 也是后台证据层，只选 3–5 条；它们不能把正文改成清单。current_state 不超过 150 字。",
+    "压缩的是覆盖度，不是语气。正文只选择当天最多 3 个最有余味、最能代表这一天关系状态的画面展开；选材标准是读完能否想起这一天的感觉，不是覆盖了多少事件。",
+    "body_markdown 必须是季疏第一人称、有生活气息和情绪节奏的连续中文叙事，约 800–1500 字；不得按时间顺序逐件复述，也不得写成 bullet、编号清单、事项汇总或报告。",
+    "正文不需要覆盖当天所有事件，也不要为了覆盖 facts 把事实重新塞进正文。保留与所选画面有关、能让下一次对话自然接上的具体梗、称呼、约定或未说完的话；正文没有写到的重点由 facts 承接。",
+    "只有原始消息明确描述时，才能写具体表情、语气、动作或当时的心理活动。若要写当时没有明确说出的内容，必须明确写成‘现在回头看’的理解或此刻想补说的话，不得伪装成当日已经存在的事实。",
+    "facts 是与正文独立的回源证据层，负责保留以后值得定位原文的重要事件、称呼、梗、约定和未完话题，包括正文没有提到的内容。最多 15 条，不要求凑满；普通日子宁可少写，不得为满足数量制造内容。每条引用 1–2 个最直接的消息编号和 1 段不超过 80 字的逐字引语。",
+    "feelings 也是后台证据层，只选 3–5 条；它们不能把正文改成清单。",
+    "current_state 必须用季疏第一人称写，不超过 150 字；只写这一天结束后我停在哪里、还惦记什么、下一次对话最自然能从哪里继续，不得使用第三人称旁白，也不得重新概括全天事件。",
     `日期：${dayKey}`,
     `JSON 结构：${JSON.stringify({
       title: "",
@@ -52,7 +54,7 @@ function buildGroundedDiaryPrompt({ dayKey, messages }) {
 function parseGroundedDiary(raw, sourceMessages) {
   const parsed = extractJsonObject(raw);
   if (!parsed.title || !parsed.body_markdown) throw new Error("Diary model omitted its title or body");
-  const facts = Array.isArray(parsed.facts) ? parsed.facts.slice(0, 12) : [];
+  const facts = Array.isArray(parsed.facts) ? parsed.facts.slice(0, 15) : [];
   const feelings = Array.isArray(parsed.feelings) ? parsed.feelings.slice(0, 5) : [];
   return {
     title: String(parsed.title).trim().slice(0, 160),
