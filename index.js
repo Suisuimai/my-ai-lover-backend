@@ -36,7 +36,7 @@ const {
 const { formatTimelineEntries, normalizeEvidenceTerms, selectRelevantTimeline } = require("./core/timeline");
 const { buildHandoffPrompt, formatWindowContinuity, parseHandoffCandidate } = require("./core/handoff");
 const { cleanClaudeSay, normalizeClaudeExport, parseTimelineCandidates, segmentClaudeMessages } = require("./core/claudeImport");
-const { groupSourceMessagesBySharedDay, hasMorningMarker, hasNightMarker } = require("./core/sharedDays");
+const { groupSourceMessagesBySharedDay, hasMorningMarker, hasNightMarker, sharedDayVersionView } = require("./core/sharedDays");
 const { buildGroundedDiaryPrompt, parseGroundedDiary, validateGroundedDiary } = require("./core/groundedDiary");
 const { applyDiaryReview, cleanText, reviewEventForAction } = require("./core/diaryReview");
 const { classifyDiaryGenerationError } = require("./core/diaryFailures");
@@ -1996,7 +1996,10 @@ app.get("/diary/shared-days", async (req, res) => {
       .order("day_key", { ascending: false }).limit(120);
     if (error) throw error;
     const versions = await latestSharedDayVersions((days || []).map((day) => day.id), req.user.id);
-    res.json({ success: true, days: (days || []).map((day) => ({ ...day, latestVersion: versions.get(day.id) || null })) });
+    res.json({ success: true, days: (days || []).map((day) => ({
+      ...day,
+      latestVersion: sharedDayVersionView(versions.get(day.id)),
+    })) });
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });
   }
