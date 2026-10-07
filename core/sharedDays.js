@@ -88,11 +88,28 @@ function groupSourceMessagesBySharedDay(messages, { cutoffHour = DEFAULT_DAY_CUT
   });
 }
 
+function sharedDayVersionView(version) {
+  if (!version) return null;
+  return {
+    id: version.id,
+    revision_number: version.revision_number,
+    started_at: version.started_at,
+    ended_at: version.ended_at,
+    morning_marker_source_id: version.morning_marker_source_id,
+    night_marker_source_id: version.night_marker_source_id,
+    boundary_state: version.boundary_state,
+    boundary_reason: version.boundary_reason,
+    source_message_count: Array.isArray(version.source_message_ids) ? version.source_message_ids.length : 0,
+    created_at: version.created_at,
+  };
+}
+
 module.exports = {
   DEFAULT_DAY_CUTOFF_HOUR,
   currentSourceMessages,
   groupSourceMessagesBySharedDay,
   hasMorningMarker,
   hasNightMarker,
+  sharedDayVersionView,
   shiftedDayKey,
 };

@@ -5,6 +5,7 @@ const {
   groupSourceMessagesBySharedDay,
   hasMorningMarker,
   hasNightMarker,
+  sharedDayVersionView,
 } = require("../core/sharedDays");
 
 function source(id, localIso, rawContent, extra = {}) {
@@ -56,4 +57,15 @@ test("keeps a correction on the original message day", () => {
     }),
   ]);
   assert.equal(group.dayKey, "2026-09-27");
+});
+
+test("shared-day list views expose counts without returning every source id", () => {
+  const view = sharedDayVersionView({
+    id: "v1", revision_number: 0, started_at: "start", ended_at: "end",
+    source_message_ids: ["s1", "s2", "s3"], boundary_state: "sealed",
+    boundary_reason: "night_marker", created_at: "created",
+  });
+  assert.equal(view.source_message_count, 3);
+  assert.equal(view.boundary_state, "sealed");
+  assert.equal("source_message_ids" in view, false);
 });
