@@ -1,3 +1,5 @@
+const { performance } = require("node:perf_hooks");
+const { createChatTiming, persistChatUsage } = require("./core/chatTiming");
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
@@ -160,10 +162,13 @@ app.use(cors({
 app.use(express.json({ limit: "2mb" }));
 
 async function requireUser(req, res, next) {
+  if (req.path === "/chat" && req.method === "POST") req.chatTiming = createChatTiming();
+  const endAuth = req.chatTiming?.start("authentication");
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
   if (!token) return res.status(401).json({ error: "Authentication required" });
   const { data, error } = await supabase.auth.getUser(token);
   if (error || !data.user) return res.status(401).json({ error: "Invalid or expired session" });
+  endAuth?.(true);
   req.user = data.user;
   next();
 }
@@ -293,9 +298,10 @@ async function recordModelUsage(event) {
   }
 }
 
-async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, onCompletion, signal, preparationMs = null }) {
+async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, onCompletion, signal, preparationMs = null, timing, onUsage }) {
   const startedAt = new Date();
-  const startedClock = Date.now();
+  const startedClock = performance.now();
+  const endUpstream = timing?.start("upstream_request");
   let provider;
   let response;
   let responseData = {};
@@ -336,9 +342,12 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
         signal,
       });
 
+      endUpstream?.(response.ok);
       if (onDelta && response.ok) {
         const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta: (delta, complete) => {
-          if (firstTokenMs === null) firstTokenMs = Math.max(0, (preparationMs || 0) + Date.now() - startedClock);
+          if (firstTokenMs === null) {
+            firstTokenMs = timing ? timing.mark("upstream_first_token") : Math.max(0, (preparationMs || 0) + performance.now() - startedClock);
+          }
           onDelta(delta, complete);
         } });
         responseData = streamed.data;
@@ -400,9 +409,12 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
       signal,
     });
 
+    endUpstream?.(response.ok);
     if (onDelta && response.ok) {
       const streamed = await readModelEventStream(response, { providerType: provider.type, onDelta: (delta, complete) => {
-        if (firstTokenMs === null) firstTokenMs = Math.max(0, (preparationMs || 0) + Date.now() - startedClock);
+        if (firstTokenMs === null) {
+          firstTokenMs = timing ? timing.mark("upstream_first_token") : Math.max(0, (preparationMs || 0) + performance.now() - startedClock);
+        }
         onDelta(delta, complete);
       } });
       responseData = streamed.data;
@@ -437,9 +449,10 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
     };
     throw error;
   } finally {
+    endUpstream?.(false);
     if (userId) {
       const usage = normalizeModelUsage(provider?.name, responseData);
-      await recordModelUsage({
+      const usageEvent = {
         user_id: userId,
         connection_id: provider?.connectionId || null,
         purpose,
@@ -463,7 +476,7 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
         provider_cost: usage.providerCost,
         cost_currency: usage.costCurrency,
         cost_source: usage.costSource,
-        duration_ms: Math.max(0, Date.now() - startedClock),
+        duration_ms: Math.max(0, performance.now() - startedClock),
         preparation_ms: Number.isFinite(preparationMs) ? Math.max(0, Math.trunc(preparationMs)) : null,
         first_token_ms: firstTokenMs,
         provider_request_id: providerRequestId,
@@ -472,7 +485,9 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
         started_at: startedAt.toISOString(),
         completed_at: new Date().toISOString(),
         provider_usage: usage.providerUsage,
-      });
+      };
+      if (onUsage) onUsage(usageEvent);
+      else await recordModelUsage(usageEvent);
     }
   }
 }
@@ -1968,25 +1983,31 @@ async function loadConfirmedDiaryForDay(userId,characterId,sharedDayId) {
   if(error)throw error; return data?.status==="confirmed"?data:null;
 }
 
-async function querySourceRecallCandidates({userId,characterId,message,allowSemantic=true}) {
+async function querySourceRecallCandidates({userId,characterId,message,allowSemantic=true,timing}) {
+  const measure = (stage, work) => timing ? timing.measure(stage, work) : work();
   const terms=retrievalQueryTerms(message); if(!terms.length)return {terms,lexicalMatches:[],semanticMatches:[],ranked:[],embeddingModel:null};
-  const lexicalResult=await supabase.rpc("match_source_window_lexical",{p_user_id:userId,p_character_id:characterId,p_terms:terms,p_limit:80});
+  const lexicalResult=await measure("bm25_lexical", () => supabase.rpc("match_source_window_lexical",{p_user_id:userId,p_character_id:characterId,p_terms:terms,p_limit:80}));
   if(lexicalResult.error)throw lexicalResult.error;
   const lexicalMatches=(lexicalResult.data||[]).filter((match)=>lexicalCandidateAccepted(match,terms));
   const admittedDays=new Set(lexicalMatches.map((match)=>match.shared_day_id));
   let semanticMatches=[]; let target=null;
   if(allowSemantic){
-    try{target=await getEmbeddingTarget(userId);if(target){const [vector]=await callEmbeddings({userId,target,inputs:[message]});const semanticResult=await supabase.rpc("match_source_window_semantic",{p_user_id:userId,p_character_id:characterId,p_model_id:target.model,p_query_embedding:JSON.stringify(vector),p_limit:80});if(semanticResult.error)throw semanticResult.error;semanticMatches=semanticResult.data||[];}}
+    try{target=await getEmbeddingTarget(userId);if(target){const [vector]=await measure("embedding_request", () => callEmbeddings({userId,target,inputs:[message]}));const semanticResult=await measure("semantic_rrf", () => supabase.rpc("match_source_window_semantic",{p_user_id:userId,p_character_id:characterId,p_model_id:target.model,p_query_embedding:JSON.stringify(vector),p_limit:80}));if(semanticResult.error)throw semanticResult.error;semanticMatches=semanticResult.data||[];}}
     catch(error){console.error("Semantic source recall failed; lexical recall remains available:",error.message);}
   }
+  const endRrf = timing?.start("semantic_rrf");
+  const ranked = rankSharedDays({lexicalMatches,semanticMatches:semanticMatches.filter((item)=>admittedDays.has(item.shared_day_id))});
+  endRrf?.();
   return {
     terms,lexicalMatches,semanticMatches,embeddingModel:target?.model||null,
-    ranked:rankSharedDays({lexicalMatches,semanticMatches:semanticMatches.filter((item)=>admittedDays.has(item.shared_day_id))}),
+    ranked,
   };
 }
 
-async function recallSharedDay({userId,characterId,sessionId,message,allowSemantic=true,writePointer=true}) {
-  const {terms,ranked}=await querySourceRecallCandidates({userId,characterId,message,allowSemantic}); if(!terms.length)return "";
+async function recallSharedDay({userId,characterId,sessionId,message,allowSemantic=true,writePointer=true,timing}) {
+  const {terms,ranked}=await querySourceRecallCandidates({userId,characterId,message,allowSemantic,timing}); if(!terms.length)return "";
+  const endAssembly = timing?.start("diary_source_assembly");
+  try {
   let selected=ranked[0]||null; let diary=selected?await loadConfirmedDiaryForDay(userId,characterId,selected.sharedDayId):null;
   let pointer=null;
   if(!selected&&sessionId){const {data}=await supabase.from("memory_recall_pointers").select("*").eq("session_id",sessionId).eq("user_id",userId).eq("active",true).maybeSingle();pointer=data||null;if(pointer&&shouldContinueRecallPointer(message)){selected={sharedDayId:pointer.shared_day_id,anchorSourceMessageIds:pointer.anchor_source_message_ids,score:1};diary=await loadConfirmedDiaryForDay(userId,characterId,pointer.shared_day_id);}else if(pointer&&writePointer){await supabase.from("memory_recall_pointers").update({active:false,updated_at:new Date().toISOString()}).eq("session_id",sessionId).eq("user_id",userId);}}
@@ -2005,6 +2026,8 @@ async function recallSharedDay({userId,characterId,sessionId,message,allowSemant
   excerpt.partial=excerpt.partial||recallIds.length<(version.source_message_ids||[]).length;
   if(writePointer&&sessionId){await supabase.from("memory_recall_pointers").upsert({session_id:sessionId,user_id:userId,character_id:characterId,shared_day_id:selected.sharedDayId,anchor_source_message_ids:selected.anchorSourceMessageIds,pointer_label:`刚才正在谈 ${day.day_key} 的共同生活`,query_terms:terms,active:true,recalled_at:new Date().toISOString(),updated_at:new Date().toISOString()},{onConflict:"session_id"});}
   return formatSharedDayRecall({dayKey:day.day_key,diary,annotations:annotations||[],messages:excerpt.messages,partial:excerpt.partial});
+  } catch (error) { endAssembly?.(false); throw error; }
+  finally { endAssembly?.(); }
 }
 
 app.get("/diary/shared-days", async (req, res) => {
@@ -3542,7 +3565,10 @@ app.post("/chat-requests/:requestId/cancel", async (req, res) => {
 
 // Core chat: persist user message, assemble context, call model, and keep retries idempotent.
 app.post("/chat", async (req, res) => {
-  const requestStartedClock = Date.now();
+  const timing = req.chatTiming || createChatTiming();
+  let chatUsageEvent;
+  let roundSuccess = false;
+  const requestStartedClock = performance.now();
   const message = typeof req.body.message === "string" ? req.body.message : "";
   if (!message.trim()) return res.status(400).json({ success: false, error: "A message is required" });
   const clientRequestId = req.body.clientRequestId;
@@ -3559,6 +3585,7 @@ app.post("/chat", async (req, res) => {
   const sendStreamEvent = (event, data) => {
     if (!wantsStream || res.writableEnded || res.destroyed) return;
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    timing.mark("first_sse_data");
   };
   if (wantsStream) {
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -3567,8 +3594,8 @@ app.post("/chat", async (req, res) => {
     res.flushHeaders();
   }
   try {
-    const { data: existingRequest, error: existingRequestError } = await supabase.from("chat_requests").select("*")
-      .eq("id", clientRequestId).eq("user_id", req.user.id).maybeSingle();
+    const { data: existingRequest, error: existingRequestError } = await timing.measure("request_lookup", () => supabase.from("chat_requests").select("*")
+      .eq("id", clientRequestId).eq("user_id", req.user.id).maybeSingle());
     if (existingRequestError) throw existingRequestError;
     if (existingRequest?.request_text !== undefined && existingRequest.request_text !== message) {
       if (wantsStream) {
@@ -3598,34 +3625,34 @@ app.post("/chat", async (req, res) => {
     let isNewSession = false;
 
     if (existingRequest) {
-      req.sessionRecord = await requireOwnedSession(sessionId, req.user.id);
+      req.sessionRecord = await timing.measure("session_load", () => requireOwnedSession(sessionId, req.user.id));
       const { data, error } = await supabase.from("chat_requests").update({
         status: "pending", error_code: null, updated_at: new Date().toISOString(), completed_at: null,
       }).eq("id", clientRequestId).eq("user_id", req.user.id).select().single();
       if (error) throw error;
       trackedRequest = data;
     } else if (!sessionId) {
-      const session = await createSession(req.user.id, DEFAULT_SESSION_NAME, req.body.characterId);
+      const session = await timing.measure("session_load", () => createSession(req.user.id, DEFAULT_SESSION_NAME, req.body.characterId));
       sessionId = session.id;
       req.sessionRecord = session;
       isNewSession = true;
     } else {
-      req.sessionRecord = await requireOwnedSession(sessionId, req.user.id);
+      req.sessionRecord = await timing.measure("session_load", () => requireOwnedSession(sessionId, req.user.id));
     }
 
     // These reads do not depend on request/message persistence. Start them now
     // so database round trips overlap instead of forming a preparation waterfall.
-    const settingsPromise = getSettings(req.user.id);
-    const characterPromise = req.sessionRecord.character_id
+    const settingsPromise = timing.measure("settings", () => getSettings(req.user.id));
+    const characterPromise = timing.measure("character", () => req.sessionRecord.character_id
       ? getOwnedCharacter(req.sessionRecord.character_id, req.user.id)
-      : getOrCreateDefaultCharacter(req.user.id);
-    const userProfilePromise = getOrCreateUserProfile(req.user.id);
+      : getOrCreateDefaultCharacter(req.user.id));
+    const userProfilePromise = timing.measure("user_profile", () => getOrCreateUserProfile(req.user.id));
     let requestLinkPromise = Promise.resolve();
 
     if (!trackedRequest) {
-      const { data, error } = await supabase.from("chat_requests").insert({
+      const { data, error } = await timing.measure("request_persistence", () => supabase.from("chat_requests").insert({
         id: clientRequestId, user_id: req.user.id, session_id: sessionId, request_text: message, status: "pending",
-      }).select().single();
+      }).select().single());
       if (error) throw error;
       trackedRequest = data;
     }
@@ -3666,24 +3693,24 @@ app.post("/chat", async (req, res) => {
     }
 
     if (!trackedRequest.user_message_id && operation === "send") {
-      const { data: userMessage, error: userMessageError } = await supabase
+      const { data: userMessage, error: userMessageError } = await timing.measure("user_message_persistence", () => supabase
         .from("messages")
         .insert({ session_id: sessionId, role: "user", content: message, is_visible: true })
-        .select("id").single();
+        .select("id").single());
       if (userMessageError) throw userMessageError;
       trackedRequest = { ...trackedRequest, user_message_id: userMessage.id };
-      requestLinkPromise = supabase.from("chat_requests").update({
+      requestLinkPromise = timing.measure("request_linkage", () => supabase.from("chat_requests").update({
         user_message_id: userMessage.id, updated_at: new Date().toISOString(),
       }).eq("id", clientRequestId).eq("user_id", req.user.id).then(({ error }) => {
         if (error) throw error;
-      });
+      }));
     }
 
-    const heartbeatPromise = supabase.from("heartbeat_settings").update({
+    const heartbeatPromise = timing.measure("heartbeat_reset", () => supabase.from("heartbeat_settings").update({
       last_chat_at: new Date().toISOString(), next_due_at: null, updated_at: new Date().toISOString(),
     }).eq("user_id", req.user.id).then(({ error }) => {
-      if (error) console.error("Heartbeat timer reset failed:", error.code || "database_error");
-    });
+      if (error) throw error;
+    })).catch(() => { console.error("Heartbeat timer reset failed"); });
 
     const [settings, character, userProfile] = await Promise.all([
       settingsPromise, characterPromise, userProfilePromise, requestLinkPromise, heartbeatPromise,
@@ -3708,25 +3735,26 @@ app.post("/chat", async (req, res) => {
       return data || [];
     };
     const [promptDocuments, continuity, relevantMemories, statusFollowUps, memorySummary, recentHistory, recalledSharedDay] = await Promise.all([
-      loadPromptDocuments(req.user.id, character.id),
-      loadWindowContinuity(req.user.id, req.sessionRecord),
-      recallMemories(req.user.id, character.id, message).catch((error) => {
+      timing.measure("prompt_documents", () => loadPromptDocuments(req.user.id, character.id)),
+      timing.measure("continuity", () => loadWindowContinuity(req.user.id, req.sessionRecord)),
+      timing.measure("long_term_memories", () => recallMemories(req.user.id, character.id, message)).catch((error) => {
         console.error("Long-term memory recall failed:", error);
         return [];
       }),
-      loadStatusFollowUps(req.user.id, character.id).catch((error) => {
+      timing.measure("followups", () => loadStatusFollowUps(req.user.id, character.id)).catch((error) => {
         console.error("Follow-up recall failed:", error);
         return [];
       }),
-      loadMemorySummary(),
-      loadRecentHistory(),
+      timing.measure("memory_summary", () => loadMemorySummary()),
+      timing.measure("recent_history", () => loadRecentHistory()),
       // Until BGE-M3 has a reliable calibrated threshold, semantic results are
       // unable to admit candidates on their own. Do not add ~10s of hot-path
       // work merely to reorder the same lexical days.
-      recallSharedDay({userId:req.user.id,characterId:character.id,sessionId,message,allowSemantic:false,writePointer:true}).catch((error)=>{
+      recallSharedDay({userId:req.user.id,characterId:character.id,sessionId,message,allowSemantic:false,writePointer:true,timing}).catch((error)=>{
         console.error("Shared-day recall failed:",error.message); return "";
       }),
     ]);
+    const endPromptAssembly = timing.start("prompt_assembly");
     const onDemandDocuments = selectRelevantPromptDocuments(promptDocuments, message, 3);
     let relevantFollowUps = [];
     const conversationalFollowUps = statusFollowUps.filter((item) => ["active", "waiting"].includes(item.status));
@@ -3762,7 +3790,8 @@ app.post("/chat", async (req, res) => {
     const requestedModel = typeof req.body.model === "string" && req.body.model.trim()
       ? req.body.model.trim()
       : settings.model;
-    const preparationMs = Math.max(0, Date.now() - requestStartedClock);
+    endPromptAssembly();
+    const preparationMs = Math.max(0, performance.now() - requestStartedClock);
     const reply = await callModel({
         purpose: "companion_chat",
         model: requestedModel,
@@ -3774,6 +3803,8 @@ app.post("/chat", async (req, res) => {
         sessionId,
         signal: abortController.signal,
         preparationMs,
+        timing,
+        onUsage: (event) => { chatUsageEvent = event; },
         onDelta: wantsStream ? (delta, complete) => {
           streamedReply = complete;
           sendStreamEvent("delta", { delta });
@@ -3878,6 +3909,7 @@ app.post("/chat", async (req, res) => {
       generationStatus,
       finishReason: modelCompletion.finishReason,
     };
+    roundSuccess = modelCompletion.complete;
     if (wantsStream) {
       sendStreamEvent(modelCompletion.complete ? "done" : "truncated", responsePayload);
       streamClosed = true;
@@ -3939,6 +3971,8 @@ app.post("/chat", async (req, res) => {
     }
     res.status(cancelled ? 409 : 500).json({ success: false, error: cancelled ? "已停止生成" : "这条消息暂时没有发送成功，请重试。" });
   } finally {
+    timing.mark("round_complete", roundSuccess);
+    persistChatUsage(chatUsageEvent, timing, recordModelUsage);
     activeChatControllers.delete(clientRequestId);
   }
 });
