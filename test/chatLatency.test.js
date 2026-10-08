@@ -7,6 +7,7 @@ const source = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
 
 test("shared-day recall reads only the matched source ids", () => {
   assert.match(source, /async function readSourceMessagesByIds[\s\S]*?\.in\("id", chunk\)/);
+  assert.match(source, /Promise\.all\(chunks\.map/);
   const recall = source.slice(source.indexOf("async function recallSharedDay"), source.indexOf("app.get(\"/diary/shared-days\""));
   assert.match(recall, /readSourceMessagesByIds\(userId,characterId,version\.source_message_ids\)/);
   assert.doesNotMatch(recall, /readAllOwnedSourceMessages/);
