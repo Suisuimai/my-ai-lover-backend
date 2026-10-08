@@ -1857,17 +1857,19 @@ async function readAllOwnedSourceMessages(userId, characterId) {
 async function readSourceMessagesByIds(userId, characterId, ids) {
   const uniqueIds = [...new Set((ids || []).filter(Boolean))];
   if (!uniqueIds.length) return [];
-  const rows = [];
   const chunkSize = 200;
+  const chunks = [];
   for (let index = 0; index < uniqueIds.length; index += chunkSize) {
-    const chunk = uniqueIds.slice(index, index + chunkSize);
+    chunks.push(uniqueIds.slice(index, index + chunkSize));
+  }
+  const batches = await Promise.all(chunks.map(async (chunk) => {
     const { data, error } = await supabase.from("source_messages")
       .select("id,role,raw_content,occurred_at,source_metadata")
       .eq("user_id", userId).eq("character_id", characterId).in("id", chunk);
     if (error) throw error;
-    rows.push(...(data || []));
-  }
-  return rows;
+    return data || [];
+  }));
+  return batches.flat();
 }
 
 async function latestSharedDayVersions(dayIds, userId) {
