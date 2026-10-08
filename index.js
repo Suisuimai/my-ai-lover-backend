@@ -2126,7 +2126,10 @@ async function processDiaryGenerationJob(jobId) {
     failureStage = "model_request";
     const raw = await callModel({
       purpose: "diary_generation", model: settings.summary_model, userId: job.user_id,
-      sessionId: job.shared_day_id, temperature: 0.2, maxTokens: 7000, responseFormat: "json_object", thinking: "disabled",
+      // The diary body is intentionally compact, but the evidence arrays and
+      // provider-side structured generation need additional completion room on
+      // message-dense days. This changes capacity, not the diary's content caps.
+      sessionId: job.shared_day_id, temperature: 0.2, maxTokens: 12000, responseFormat: "json_object", thinking: "disabled",
       messages: [
         { role: "system", content: "你只根据给定原始消息写有证据的第一人称中文日记，并严格返回指定 JSON。" },
         { role: "user", content: buildGroundedDiaryPrompt({ dayKey: day.day_key, messages: sourceMessages }) },
