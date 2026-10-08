@@ -9,7 +9,8 @@ test("shared-day recall reads only the matched source ids", () => {
   assert.match(source, /async function readSourceMessagesByIds[\s\S]*?\.in\("id", chunk\)/);
   assert.match(source, /Promise\.all\(chunks\.map/);
   const recall = source.slice(source.indexOf("async function recallSharedDay"), source.indexOf("app.get(\"/diary/shared-days\""));
-  assert.match(recall, /readSourceMessagesByIds\(userId,characterId,version\.source_message_ids\)/);
+  assert.match(recall, /recallSourceIds\(version\.source_message_ids,selected\.anchorSourceMessageIds\)/);
+  assert.match(recall, /readSourceMessagesByIds\(userId,characterId,recallIds\)/);
   assert.doesNotMatch(recall, /readAllOwnedSourceMessages/);
 });
 
