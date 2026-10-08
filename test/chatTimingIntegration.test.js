@@ -41,7 +41,9 @@ test("real callModel records first delta and defers chat usage without blocking 
   assert.ok(rows.upstream_first_token.success);
   assert.ok(rows.upstream_request.success);
   assert.ok(rows.first_sse_data.ms >= rows.upstream_first_token.ms);
-  assert.equal(event.first_token_ms, rows.upstream_first_token.ms);
+  assert.equal(event.first_token_ms, Math.trunc(rows.upstream_first_token.ms));
+  assert.ok(Number.isInteger(event.duration_ms));
+  assert.ok(Number.isInteger(event.first_token_ms));
 });
 
 test("real /chat persists breakdown after final SSE, independent of a hung ledger", async () => {
@@ -152,4 +154,46 @@ test("real callModel retains a failed usage event without leaking the thrown err
   assert.equal(event.status, "failed");
   assert.equal(timing.snapshot().find((row) => row.stage === "upstream_request").success, false);
   assert.equal(JSON.stringify(timing.snapshot()).includes("sensitive"), false);
+  assert.ok(Number.isInteger(event.duration_ms));
+  assert.equal(event.first_token_ms, null);
+});
+
+test("real model usage is compatible with integer SQL columns under fractional clocks", async () => {
+  let clock = 100.125;
+  const timing = createChatTiming(() => clock);
+  clock += 12.75;
+  let event;
+  const context = {
+    performance: { now: () => clock }, Date,
+    getModelTarget: async () => ({
+      type: "openai-compatible", name: "openrouter", model: "test", apiKey: "test-only",
+    }),
+    prepareMessagesForProvider: (messages) => messages,
+    fetch: async () => {
+      clock += 1.25;
+      return { ok: true, status: 200, headers: { get: () => null } };
+    },
+    readModelEventStream: async (_, { onDelta }) => {
+      clock += 2.375;
+      onDelta("reply", "reply");
+      clock += 3.125;
+      return { text: "reply", data: {}, completion: { complete: true, status: "complete" } };
+    },
+    normalizeModelUsage: () => ({ providerUsage: {} }),
+  };
+  const functionSource = source.slice(source.indexOf("async function callModel("), source.indexOf("async function maybeCompressMemory("));
+  const callModel = vm.runInNewContext(`${functionSource}\ncallModel`, context);
+  await callModel({
+    userId: "user", messages: [], timing, preparationMs: 12.75,
+    onDelta: () => {}, onUsage: (value) => { event = value; },
+  });
+  // Emulate the integer-column constraint at the real usage-write boundary.
+  for (const column of ["duration_ms", "preparation_ms", "first_token_ms"]) {
+    assert.ok(Number.isInteger(event[column]), column);
+    assert.ok(event[column] >= 0, column);
+  }
+  assert.equal(event.duration_ms, 6);
+  assert.equal(event.first_token_ms, 16);
+  assert.equal(event.preparation_ms, 12);
+  assert.equal(timing.snapshot().find((row) => row.stage === "upstream_first_token").ms, 16.375);
 });
