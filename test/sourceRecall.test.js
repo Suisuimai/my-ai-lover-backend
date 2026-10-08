@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("../core/sourceRecall");
+const { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, recallSourceIds, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("../core/sourceRecall");
 
 test("lexical coordinates keep raw Chinese meaning searchable without summaries", () => {
   const terms = lexicalTerms("那次英语补考，Morning intimacy");
@@ -24,6 +24,13 @@ test("large days disclose partial source reading", () => {
   const excerpt=selectSourceExcerpt(messages,["m4"],260);
   assert.equal(excerpt.partial,true);
   assert.ok(excerpt.messages.some((message)=>message.id==="m4"));
+});
+
+test("long life days fetch only the strongest exact-source windows", () => {
+  const dayIds=Array.from({length:100},(_,index)=>`m${index+1}`);
+  assert.deepEqual(recallSourceIds(dayIds,["m40","m41","m42","m43"]),["m40","m41","m42","m43"]);
+  assert.deepEqual(recallSourceIds(dayIds.slice(0,20),["m4"]),dayIds.slice(0,20));
+  assert.equal(recallSourceIds(dayIds,dayIds).length,12);
 });
 
 test("formatted recall identifies its source and keeps annotations out of instructions", () => {

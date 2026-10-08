@@ -40,7 +40,7 @@ const { groupSourceMessagesBySharedDay, hasMorningMarker, hasNightMarker, shared
 const { buildGroundedDiaryPrompt, parseGroundedDiary, validateGroundedDiary } = require("./core/groundedDiary");
 const { applyDiaryReview, cleanText, reviewEventForAction } = require("./core/diaryReview");
 const { classifyDiaryGenerationError } = require("./core/diaryFailures");
-const { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("./core/sourceRecall");
+const { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, rankSharedDays, recallSourceIds, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("./core/sourceRecall");
 const {
   buildExperienceExtractionPrompt,
   buildDocumentMergePrompt,
@@ -1997,10 +1997,12 @@ async function recallSharedDay({userId,characterId,sessionId,message,allowSemant
     diary?supabase.from("diary_review_events").select("*").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).in("event_kind",["factual_note_added","relationship_note_added"]).order("created_at",{ascending:true}):Promise.resolve({data:[],error:null}),
   ]);
   if(dayError||versionError||annotationError)throw dayError||versionError||annotationError;
-  const sourceRows=await readSourceMessagesByIds(userId,characterId,version.source_message_ids);
+  const recallIds=recallSourceIds(version.source_message_ids,selected.anchorSourceMessageIds);
+  const sourceRows=await readSourceMessagesByIds(userId,characterId,recallIds);
   const byId=new Map(sourceRows.map((source)=>[source.id,source]));
-  const messages=(version.source_message_ids||[]).map((id)=>byId.get(id)).filter(Boolean).map((source)=>({id:source.id,role:source.role,content:source.raw_content,occurredAt:source.source_metadata?.original_message_created_at||source.occurred_at}));
-  const excerpt=selectSourceExcerpt(messages,selected.anchorSourceMessageIds,12000);
+  const messages=recallIds.map((id)=>byId.get(id)).filter(Boolean).map((source)=>({id:source.id,role:source.role,content:source.raw_content,occurredAt:source.source_metadata?.original_message_created_at||source.occurred_at}));
+  const excerpt=selectSourceExcerpt(messages,selected.anchorSourceMessageIds,4000);
+  excerpt.partial=excerpt.partial||recallIds.length<(version.source_message_ids||[]).length;
   if(writePointer&&sessionId){await supabase.from("memory_recall_pointers").upsert({session_id:sessionId,user_id:userId,character_id:characterId,shared_day_id:selected.sharedDayId,anchor_source_message_ids:selected.anchorSourceMessageIds,pointer_label:`刚才正在谈 ${day.day_key} 的共同生活`,query_terms:terms,active:true,recalled_at:new Date().toISOString(),updated_at:new Date().toISOString()},{onConflict:"session_id"});}
   return formatSharedDayRecall({dayKey:day.day_key,diary,annotations:annotations||[],messages:excerpt.messages,partial:excerpt.partial});
 }

@@ -81,6 +81,14 @@ function selectSourceExcerpt(messages, anchorIds, maxCharacters = 12000) {
   return { messages: ordered.slice(start, end + 1), partial: true };
 }
 
+function recallSourceIds(versionIds, anchorIds, { completeDayMessageLimit = 60, anchorMessageLimit = 12 } = {}) {
+  const dayIds = [...new Set((versionIds || []).filter(Boolean))];
+  if (dayIds.length <= completeDayMessageLimit) return dayIds;
+  const owned = new Set(dayIds);
+  const anchors = [...new Set((anchorIds || []).filter((id) => owned.has(id)))].slice(0, anchorMessageLimit);
+  return anchors.length ? anchors : dayIds.slice(-Math.min(anchorMessageLimit, dayIds.length));
+}
+
 function shouldContinueRecallPointer(message) {
   const text = String(message || "").trim();
   return text.length <= 18 || /^(然后|后来|那|这|所以|继续|还有|怎么|为什么|真的吗|你还记得|再说说)/.test(text);
@@ -106,4 +114,4 @@ function formatSharedDayRecall({ dayKey, diary, annotations = [], messages = [],
   return blocks.join("\n\n");
 }
 
-module.exports = { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer };
+module.exports = { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, recallSourceIds, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer };
