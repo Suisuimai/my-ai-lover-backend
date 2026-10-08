@@ -3613,6 +3613,15 @@ app.post("/chat", async (req, res) => {
       req.sessionRecord = await requireOwnedSession(sessionId, req.user.id);
     }
 
+    // These reads do not depend on request/message persistence. Start them now
+    // so database round trips overlap instead of forming a preparation waterfall.
+    const settingsPromise = getSettings(req.user.id);
+    const characterPromise = req.sessionRecord.character_id
+      ? getOwnedCharacter(req.sessionRecord.character_id, req.user.id)
+      : getOrCreateDefaultCharacter(req.user.id);
+    const userProfilePromise = getOrCreateUserProfile(req.user.id);
+    let requestLinkPromise = Promise.resolve();
+
     if (!trackedRequest) {
       const { data, error } = await supabase.from("chat_requests").insert({
         id: clientRequestId, user_id: req.user.id, session_id: sessionId, request_text: message, status: "pending",
@@ -3662,26 +3671,22 @@ app.post("/chat", async (req, res) => {
         .insert({ session_id: sessionId, role: "user", content: message, is_visible: true })
         .select("id").single();
       if (userMessageError) throw userMessageError;
-      const { data, error } = await supabase.from("chat_requests").update({
+      trackedRequest = { ...trackedRequest, user_message_id: userMessage.id };
+      requestLinkPromise = supabase.from("chat_requests").update({
         user_message_id: userMessage.id, updated_at: new Date().toISOString(),
-      }).eq("id", clientRequestId).eq("user_id", req.user.id).select().single();
-      if (error) throw error;
-      trackedRequest = data;
+      }).eq("id", clientRequestId).eq("user_id", req.user.id).then(({ error }) => {
+        if (error) throw error;
+      });
     }
 
-    const { error: heartbeatResetError } = await supabase.from("heartbeat_settings").update({
-      last_chat_at: new Date().toISOString(),
-      next_due_at: null,
-      updated_at: new Date().toISOString(),
-    }).eq("user_id", req.user.id);
-    if (heartbeatResetError) console.error("Heartbeat timer reset failed:", heartbeatResetError.code || "database_error");
+    const heartbeatPromise = supabase.from("heartbeat_settings").update({
+      last_chat_at: new Date().toISOString(), next_due_at: null, updated_at: new Date().toISOString(),
+    }).eq("user_id", req.user.id).then(({ error }) => {
+      if (error) console.error("Heartbeat timer reset failed:", error.code || "database_error");
+    });
 
     const [settings, character, userProfile] = await Promise.all([
-      getSettings(req.user.id),
-      req.sessionRecord.character_id
-        ? getOwnedCharacter(req.sessionRecord.character_id, req.user.id)
-        : getOrCreateDefaultCharacter(req.user.id),
-      getOrCreateUserProfile(req.user.id),
+      settingsPromise, characterPromise, userProfilePromise, requestLinkPromise, heartbeatPromise,
     ]);
     const loadMemorySummary = async () => {
       try {
@@ -3715,7 +3720,10 @@ app.post("/chat", async (req, res) => {
       }),
       loadMemorySummary(),
       loadRecentHistory(),
-      recallSharedDay({userId:req.user.id,characterId:character.id,sessionId,message,allowSemantic:true,writePointer:true}).catch((error)=>{
+      // Until BGE-M3 has a reliable calibrated threshold, semantic results are
+      // unable to admit candidates on their own. Do not add ~10s of hot-path
+      // work merely to reorder the same lexical days.
+      recallSharedDay({userId:req.user.id,characterId:character.id,sessionId,message,allowSemantic:false,writePointer:true}).catch((error)=>{
         console.error("Shared-day recall failed:",error.message); return "";
       }),
     ]);
