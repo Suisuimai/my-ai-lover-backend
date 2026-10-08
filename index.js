@@ -2129,7 +2129,7 @@ async function processDiaryGenerationJob(jobId) {
       // The diary body is intentionally compact, but the evidence arrays and
       // provider-side structured generation need additional completion room on
       // message-dense days. This changes capacity, not the diary's content caps.
-      sessionId: job.shared_day_id, temperature: 0.2, maxTokens: 16000, responseFormat: "json_object", thinking: "disabled",
+      sessionId: job.shared_day_id, temperature: 0.2, maxTokens: 24000, responseFormat: "json_object", thinking: "disabled",
       messages: [
         { role: "system", content: "你只根据给定原始消息写有证据的第一人称中文日记，并严格返回指定 JSON。" },
         { role: "user", content: buildGroundedDiaryPrompt({ dayKey: day.day_key, messages: sourceMessages }) },
