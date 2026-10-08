@@ -1854,6 +1854,22 @@ async function readAllOwnedSourceMessages(userId, characterId) {
   return messages;
 }
 
+async function readSourceMessagesByIds(userId, characterId, ids) {
+  const uniqueIds = [...new Set((ids || []).filter(Boolean))];
+  if (!uniqueIds.length) return [];
+  const rows = [];
+  const chunkSize = 200;
+  for (let index = 0; index < uniqueIds.length; index += chunkSize) {
+    const chunk = uniqueIds.slice(index, index + chunkSize);
+    const { data, error } = await supabase.from("source_messages")
+      .select("id,role,raw_content,occurred_at,source_metadata")
+      .eq("user_id", userId).eq("character_id", characterId).in("id", chunk);
+    if (error) throw error;
+    rows.push(...(data || []));
+  }
+  return rows;
+}
+
 async function latestSharedDayVersions(dayIds, userId) {
   if (!dayIds.length) return new Map();
   const { data, error } = await supabase.from("shared_life_day_versions").select("*")
@@ -1979,7 +1995,8 @@ async function recallSharedDay({userId,characterId,sessionId,message,allowSemant
     diary?supabase.from("diary_review_events").select("*").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).in("event_kind",["factual_note_added","relationship_note_added"]).order("created_at",{ascending:true}):Promise.resolve({data:[],error:null}),
   ]);
   if(dayError||versionError||annotationError)throw dayError||versionError||annotationError;
-  const byId=new Map((await readAllOwnedSourceMessages(userId,characterId)).map((source)=>[source.id,source]));
+  const sourceRows=await readSourceMessagesByIds(userId,characterId,version.source_message_ids);
+  const byId=new Map(sourceRows.map((source)=>[source.id,source]));
   const messages=(version.source_message_ids||[]).map((id)=>byId.get(id)).filter(Boolean).map((source)=>({id:source.id,role:source.role,content:source.raw_content,occurredAt:source.source_metadata?.original_message_created_at||source.occurred_at}));
   const excerpt=selectSourceExcerpt(messages,selected.anchorSourceMessageIds,12000);
   if(writePointer&&sessionId){await supabase.from("memory_recall_pointers").upsert({session_id:sessionId,user_id:userId,character_id:characterId,shared_day_id:selected.sharedDayId,anchor_source_message_ids:selected.anchorSourceMessageIds,pointer_label:`刚才正在谈 ${day.day_key} 的共同生活`,query_terms:terms,active:true,recalled_at:new Date().toISOString(),updated_at:new Date().toISOString()},{onConflict:"session_id"});}
@@ -3738,7 +3755,8 @@ app.post("/chat", async (req, res) => {
         purpose: "companion_chat",
         model: requestedModel,
         temperature: settings.temperature,
-        maxTokens: settings.max_tokens,
+        thinking: "disabled",
+        maxTokens: Math.max(1200, Number(settings.max_tokens) || 1200),
         messages: context,
         userId: req.user.id,
         sessionId,
