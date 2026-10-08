@@ -4,18 +4,18 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const { performance } = require("node:perf_hooks");
 const { createChatTiming, persistChatUsage } = require("../core/chatTiming");
+const { startChatTask } = require("../core/chatPreparation");
 const source = fs.readFileSync(require.resolve("../index.js"), "utf8");
 
 test("real callModel records first delta and defers chat usage without blocking streaming", async () => {
   const timing = createChatTiming();
   let event;
   let writes = 0;
+  let repeatedRouting = 0;
   let deltas = 0;
   const context = {
     performance, Date,
-    getModelTarget: async () => ({
-      type: "openai-compatible", name: "openrouter", model: "anthropic/test", apiKey: "test-only",
-    }),
+    getModelTarget: async () => { repeatedRouting++; throw new Error("routing should already be ready"); },
     prepareMessagesForProvider: (messages) => messages,
     fetch: async () => ({ ok: true, status: 200, headers: { get: () => null } }),
     readModelEventStream: async (_, { onDelta }) => {
@@ -30,12 +30,16 @@ test("real callModel records first delta and defers chat usage without blocking 
   const callModel = vm.runInNewContext(`${functionSource}\ncallModel`, context);
   const reply = await callModel({
     userId: "user", messages: [], timing, preparationMs: 0,
+    modelTargetPromise: Promise.resolve({
+      type: "openai-compatible", name: "openrouter", model: "anthropic/test", apiKey: "test-only",
+    }),
     onDelta: () => { deltas++; timing.mark("first_sse_data"); },
     onUsage: (value) => { event = value; },
   });
   assert.equal(reply, "ab");
   assert.equal(deltas, 2);
   assert.equal(writes, 0);
+  assert.equal(repeatedRouting, 0);
   assert.equal(event.status, "succeeded");
   const rows = Object.fromEntries(timing.snapshot().map((row) => [row.stage, row]));
   assert.ok(rows.upstream_first_token.success);
@@ -46,11 +50,18 @@ test("real callModel records first delta and defers chat usage without blocking 
   assert.ok(Number.isInteger(event.first_token_ms));
 });
 
-test("real /chat persists breakdown after final SSE, independent of a hung ledger", async () => {
+test("real /chat overlaps linkage and heartbeat with reads, but awaits both before generation", { timeout: 2000 }, async () => {
   let route;
   let persisted;
   let ended = false;
   const events = [];
+  let messageSaved = false;
+  let linked = false;
+  let heartbeatDone = false;
+  let releaseHeartbeat;
+  const heartbeatGate = new Promise((resolve) => { releaseHeartbeat = resolve; });
+  let releaseLinkage;
+  const linkageGate = new Promise((resolve) => { releaseLinkage = resolve; });
   const query = (table) => {
     let action = "select";
     const chain = {
@@ -59,6 +70,23 @@ test("real /chat persists breakdown after final SSE, independent of a hung ledge
       update() { action = "update"; return chain; },
       single() { return chain; }, maybeSingle() { return chain; },
       then(resolve, reject) {
+        if (table === "heartbeat_settings") {
+          return heartbeatGate.then(() => {
+            heartbeatDone = true;
+            return { data: null, error: null };
+          }).then(resolve, reject);
+        }
+        if (table === "chat_requests" && action === "update" && !linked) {
+          return linkageGate.then(() => {
+            linked = true;
+            return { data: null, error: null };
+          }).then(resolve, reject);
+        }
+        if (table === "messages" && action === "insert") messageSaved = true;
+        if (table === "messages" && action === "select") {
+          assert.equal(messageSaved, true);
+          releaseLinkage();
+        }
         const data = table === "chat_requests"
           ? (action === "select" ? null : { id: "request", session_id: "session" })
           : table === "messages" ? (action === "insert" ? { id: "message" } : [])
@@ -70,10 +98,11 @@ test("real /chat persists breakdown after final SSE, independent of a hung ledge
   };
   const context = {
     app: { post: (_, handler) => { route = handler; } },
-    performance, Date, AbortController, console, createChatTiming, persistChatUsage,
+    performance, Date, AbortController, console, createChatTiming, persistChatUsage, startChatTask,
     validUuid: () => true, supabase: { from: query }, activeChatControllers: new Map(),
     requireOwnedSession: async () => ({ character_id: "character" }),
     getSettings: async () => ({ model: "test" }),
+    getModelTarget: async () => ({ model: "test", name: "openrouter" }),
     getOwnedCharacter: async () => ({ id: "character" }),
     getOrCreateUserProfile: async () => ({}),
     maybeCompressMemory: async () => "",
@@ -83,6 +112,8 @@ test("real /chat persists breakdown after final SSE, independent of a hung ledge
     recallMemories: async () => [], loadStatusFollowUps: async () => [],
     recallSharedDay: async ({ allowSemantic }) => {
       assert.equal(allowSemantic, false);
+      assert.equal(messageSaved, true);
+      releaseHeartbeat();
       return "";
     },
     selectRelevantPromptDocuments: () => [], selectRelevantFollowUps: () => [],
@@ -91,7 +122,10 @@ test("real /chat persists breakdown after final SSE, independent of a hung ledge
     formatRetrievedPromptDocuments: () => "", formatCharacterProfile: () => "",
     formatUserProfile: () => "", formatWindowContinuity: () => "",
     formatFollowUps: () => "", formatLongTermMemories: () => "",
-    callModel: async ({ timing, onDelta, onCompletion, onUsage }) => {
+    callModel: async ({ timing, onDelta, onCompletion, onUsage, modelTargetPromise }) => {
+      assert.equal(linked, true);
+      assert.equal(heartbeatDone, true);
+      assert.equal((await modelTargetPromise).model, "test");
       timing.mark("upstream_first_token");
       onDelta("reply", "reply");
       onCompletion({ complete: true, status: "complete", finishReason: "stop" });
@@ -132,6 +166,28 @@ test("real /chat persists breakdown after final SSE, independent of a hung ledge
   }
   assert.equal(rows.embedding_request.success, false);
   assert.equal(rows.embedding_request.ms, 0);
+});
+
+test("real callModel consumes prefetched routing once and preserves failure accounting", async () => {
+  const timing = createChatTiming();
+  let routingCalls = 0;
+  let event;
+  const context = {
+    performance, Date,
+    getModelTarget: () => { routingCalls++; throw new Error("unexpected repeated routing"); },
+    prepareMessagesForProvider: (messages) => messages,
+    normalizeModelUsage: () => ({ providerUsage: {} }),
+  };
+  const functionSource = source.slice(source.indexOf("async function callModel("), source.indexOf("async function maybeCompressMemory("));
+  const callModel = vm.runInNewContext(`${functionSource}\ncallModel`, context);
+  const modelTargetPromise = startChatTask(() => { throw new Error("routing failed"); });
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(callModel({
+    userId: "user", messages: [], timing, modelTargetPromise,
+    onUsage: (value) => { event = value; },
+  }), /routing failed/);
+  assert.equal(routingCalls, 0);
+  assert.equal(event.status, "failed");
 });
 
 test("real callModel retains a failed usage event without leaking the thrown error", async () => {

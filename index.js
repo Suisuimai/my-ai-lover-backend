@@ -1,5 +1,6 @@
 const { performance } = require("node:perf_hooks");
 const { createChatTiming, persistChatUsage } = require("./core/chatTiming");
+const { startChatTask } = require("./core/chatPreparation");
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
@@ -298,7 +299,7 @@ async function recordModelUsage(event) {
   }
 }
 
-async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, onCompletion, signal, preparationMs = null, timing, onUsage }) {
+async function callModel({ model, messages, temperature, maxTokens, userId, sessionId, responseFormat, thinking, purpose = "unspecified", onDelta, onCompletion, signal, preparationMs = null, timing, onUsage, modelTargetPromise }) {
   const startedAt = new Date();
   const startedClock = performance.now();
   const endUpstream = timing?.start("upstream_request");
@@ -313,7 +314,7 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
   let completion = null;
 
   try {
-    provider = await getModelTarget({ userId, purpose, legacyModel: model });
+    provider = await (modelTargetPromise || getModelTarget({ userId, purpose, legacyModel: model }));
     model = provider.model;
     if (!provider.apiKey) throw new Error(`${provider.name} API key is not configured. Add it in Settings.`);
     const providerMessages = prepareMessagesForProvider(messages, {
@@ -2008,18 +2009,33 @@ async function recallSharedDay({userId,characterId,sessionId,message,allowSemant
   const {terms,ranked}=await querySourceRecallCandidates({userId,characterId,message,allowSemantic,timing}); if(!terms.length)return "";
   const endAssembly = timing?.start("diary_source_assembly");
   try {
-  let selected=ranked[0]||null; let diary=selected?await loadConfirmedDiaryForDay(userId,characterId,selected.sharedDayId):null;
+  let selected=ranked[0]||null;
   let pointer=null;
-  if(!selected&&sessionId){const {data}=await supabase.from("memory_recall_pointers").select("*").eq("session_id",sessionId).eq("user_id",userId).eq("active",true).maybeSingle();pointer=data||null;if(pointer&&shouldContinueRecallPointer(message)){selected={sharedDayId:pointer.shared_day_id,anchorSourceMessageIds:pointer.anchor_source_message_ids,score:1};diary=await loadConfirmedDiaryForDay(userId,characterId,pointer.shared_day_id);}else if(pointer&&writePointer){await supabase.from("memory_recall_pointers").update({active:false,updated_at:new Date().toISOString()}).eq("session_id",sessionId).eq("user_id",userId);}}
+  if(!selected&&sessionId){const {data}=await supabase.from("memory_recall_pointers").select("*").eq("session_id",sessionId).eq("user_id",userId).eq("active",true).maybeSingle();pointer=data||null;if(pointer&&shouldContinueRecallPointer(message)){selected={sharedDayId:pointer.shared_day_id,anchorSourceMessageIds:pointer.anchor_source_message_ids,score:1};}else if(pointer&&writePointer){await supabase.from("memory_recall_pointers").update({active:false,updated_at:new Date().toISOString()}).eq("session_id",sessionId).eq("user_id",userId);}}
   if(!selected)return "本轮自动回忆检索没有找到带有真实字面证据的旧事。不要拿仅有语义相似但尚未标定的候选猜测，也不要假装已经想起来。";
-  const [{data:day,error:dayError},{data:version,error:versionError},{data:annotations,error:annotationError}]=await Promise.all([
+  // Diary/annotations and exact-source reads depend on different records.
+  // Overlap them without changing confirmation gates or source selection.
+  const diaryAndAnnotations = startChatTask(async () => {
+    const diary = await loadConfirmedDiaryForDay(userId,characterId,selected.sharedDayId);
+    const {data:annotations,error}=diary
+      ? await supabase.from("diary_review_events").select("*").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).in("event_kind",["factual_note_added","relationship_note_added"]).order("created_at",{ascending:true})
+      : {data:[],error:null};
+    if(error)throw error;
+    return {diary,annotations};
+  });
+  const versionAndSources = startChatTask(async () => {
+    const {data:version,error}=await supabase.from("shared_life_day_versions").select("source_message_ids").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).order("revision_number",{ascending:false}).limit(1).single();
+    if(error)throw error;
+    const recallIds=recallSourceIds(version.source_message_ids,selected.anchorSourceMessageIds);
+    const sourceRows=await readSourceMessagesByIds(userId,characterId,recallIds);
+    return {version,recallIds,sourceRows};
+  });
+  const [{data:day,error:dayError},{diary,annotations},{version,recallIds,sourceRows}]=await Promise.all([
     supabase.from("shared_life_days").select("day_key").eq("id",selected.sharedDayId).eq("user_id",userId).single(),
-    supabase.from("shared_life_day_versions").select("source_message_ids").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).order("revision_number",{ascending:false}).limit(1).single(),
-    diary?supabase.from("diary_review_events").select("*").eq("shared_day_id",selected.sharedDayId).eq("user_id",userId).in("event_kind",["factual_note_added","relationship_note_added"]).order("created_at",{ascending:true}):Promise.resolve({data:[],error:null}),
+    diaryAndAnnotations,
+    versionAndSources,
   ]);
-  if(dayError||versionError||annotationError)throw dayError||versionError||annotationError;
-  const recallIds=recallSourceIds(version.source_message_ids,selected.anchorSourceMessageIds);
-  const sourceRows=await readSourceMessagesByIds(userId,characterId,recallIds);
+  if(dayError)throw dayError;
   const byId=new Map(sourceRows.map((source)=>[source.id,source]));
   const messages=recallIds.map((id)=>byId.get(id)).filter(Boolean).map((source)=>({id:source.id,role:source.role,content:source.raw_content,occurredAt:source.source_metadata?.original_message_created_at||source.occurred_at}));
   const excerpt=selectSourceExcerpt(messages,selected.anchorSourceMessageIds,4000);
@@ -3642,11 +3658,20 @@ app.post("/chat", async (req, res) => {
 
     // These reads do not depend on request/message persistence. Start them now
     // so database round trips overlap instead of forming a preparation waterfall.
-    const settingsPromise = timing.measure("settings", () => getSettings(req.user.id));
-    const characterPromise = timing.measure("character", () => req.sessionRecord.character_id
+    const settingsPromise = startChatTask(() => timing.measure("settings", () => getSettings(req.user.id)));
+    const characterPromise = startChatTask(() => timing.measure("character", () => req.sessionRecord.character_id
       ? getOwnedCharacter(req.sessionRecord.character_id, req.user.id)
-      : getOrCreateDefaultCharacter(req.user.id));
-    const userProfilePromise = timing.measure("user_profile", () => getOrCreateUserProfile(req.user.id));
+      : getOrCreateDefaultCharacter(req.user.id)));
+    const userProfilePromise = startChatTask(() => timing.measure("user_profile", () => getOrCreateUserProfile(req.user.id)));
+    const modelTargetPromise = startChatTask(async () => {
+      const settings = await settingsPromise;
+      const requestedModel = typeof req.body.model === "string" && req.body.model.trim()
+        ? req.body.model.trim()
+        : settings.model;
+      return timing.measure("model_routing", () => getModelTarget({
+        userId: req.user.id, purpose: "companion_chat", legacyModel: requestedModel,
+      }));
+    });
     let requestLinkPromise = Promise.resolve();
 
     if (!trackedRequest) {
@@ -3712,10 +3737,8 @@ app.post("/chat", async (req, res) => {
       if (error) throw error;
     })).catch(() => { console.error("Heartbeat timer reset failed"); });
 
-    const [settings, character, userProfile] = await Promise.all([
-      settingsPromise, characterPromise, userProfilePromise, requestLinkPromise, heartbeatPromise,
-    ]);
     const loadMemorySummary = async () => {
+      const settings = await settingsPromise;
       try {
         return await maybeCompressMemory(sessionId, settings, req.user.id);
       } catch (compressionError) {
@@ -3727,6 +3750,7 @@ app.post("/chat", async (req, res) => {
       }
     };
     const loadRecentHistory = async () => {
+      const settings = await settingsPromise;
       const { data, error } = await supabase.from("messages").select("role, content")
         .eq("session_id", sessionId).eq("is_visible", true).eq("context_status", "active")
         .order("created_at", { ascending: false })
@@ -3734,25 +3758,30 @@ app.post("/chat", async (req, res) => {
       if (error) throw error;
       return data || [];
     };
-    const [promptDocuments, continuity, relevantMemories, statusFollowUps, memorySummary, recentHistory, recalledSharedDay] = await Promise.all([
-      timing.measure("prompt_documents", () => loadPromptDocuments(req.user.id, character.id)),
+    // Read current history/recall only after the user message or edit is saved.
+    // Linkage/heartbeat still finish before generation, but no longer gate reads.
+    const contextReadsPromise = Promise.all([
+      characterPromise.then((character) => timing.measure("prompt_documents", () => loadPromptDocuments(req.user.id, character.id))),
       timing.measure("continuity", () => loadWindowContinuity(req.user.id, req.sessionRecord)),
-      timing.measure("long_term_memories", () => recallMemories(req.user.id, character.id, message)).catch((error) => {
+      characterPromise.then((character) => timing.measure("long_term_memories", () => recallMemories(req.user.id, character.id, message))).catch((error) => {
         console.error("Long-term memory recall failed:", error);
         return [];
       }),
-      timing.measure("followups", () => loadStatusFollowUps(req.user.id, character.id)).catch((error) => {
+      characterPromise.then((character) => timing.measure("followups", () => loadStatusFollowUps(req.user.id, character.id))).catch((error) => {
         console.error("Follow-up recall failed:", error);
         return [];
       }),
-      timing.measure("memory_summary", () => loadMemorySummary()),
-      timing.measure("recent_history", () => loadRecentHistory()),
+      settingsPromise.then(() => timing.measure("memory_summary", () => loadMemorySummary())),
+      settingsPromise.then(() => timing.measure("recent_history", () => loadRecentHistory())),
       // Until BGE-M3 has a reliable calibrated threshold, semantic results are
       // unable to admit candidates on their own. Do not add ~10s of hot-path
       // work merely to reorder the same lexical days.
-      recallSharedDay({userId:req.user.id,characterId:character.id,sessionId,message,allowSemantic:false,writePointer:true,timing}).catch((error)=>{
+      characterPromise.then((character) => recallSharedDay({userId:req.user.id,characterId:character.id,sessionId,message,allowSemantic:false,writePointer:true,timing})).catch((error)=>{
         console.error("Shared-day recall failed:",error.message); return "";
       }),
+    ]);
+    const [settings, character, userProfile, [promptDocuments, continuity, relevantMemories, statusFollowUps, memorySummary, recentHistory, recalledSharedDay]] = await Promise.all([
+      settingsPromise, characterPromise, userProfilePromise, contextReadsPromise, requestLinkPromise, heartbeatPromise,
     ]);
     const endPromptAssembly = timing.start("prompt_assembly");
     const onDemandDocuments = selectRelevantPromptDocuments(promptDocuments, message, 3);
@@ -3804,6 +3833,7 @@ app.post("/chat", async (req, res) => {
         signal: abortController.signal,
         preparationMs,
         timing,
+        modelTargetPromise,
         onUsage: (event) => { chatUsageEvent = event; },
         onDelta: wantsStream ? (delta, complete) => {
           streamedReply = complete;

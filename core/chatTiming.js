@@ -7,7 +7,7 @@ const STAGES = [
   "settings", "character", "user_profile", "recent_history", "prompt_documents",
   "continuity", "long_term_memories", "followups", "memory_summary",
   "bm25_lexical", "embedding_request", "semantic_rrf", "diary_source_assembly",
-  "prompt_assembly", "upstream_request", "upstream_first_token",
+  "prompt_assembly", "model_routing", "upstream_request", "upstream_first_token",
   "first_sse_data", "round_complete",
 ];
 

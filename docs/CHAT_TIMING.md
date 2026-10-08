@@ -11,8 +11,12 @@ source text, credentials, or error details enter the breakdown.
 - Operation stages measure their own elapsed duration. Settings, profiles,
   history, and recall can overlap; do not add their durations to estimate total
   latency.
-- `upstream_request` measures model routing/message preparation and HTTP request
-  through response headers, not the entire generation.
+- `model_routing` measures the chat model-route/connection lookup, started as
+  soon as settings are available, overlapping request persistence and context
+  preparation. No model request is sent until preparation succeeds.
+- `upstream_request` measures any remaining wait for model routing, message
+  preparation, and HTTP request through response headers, not the entire
+  generation. Routing is not repeated when the prefetched result is consumed.
 - `upstream_first_token`, `first_sse_data`, and `round_complete` are milestones
   measured from authentication start. First token means first visible text
   delta, not an upstream heartbeat, reasoning delta, or role event.
@@ -30,6 +34,16 @@ source text, credentials, or error details enter the breakdown.
 `first_token_ms` now includes authentication and equals the first-token
 milestone. `duration_ms` remains model-call duration. All durations use the
 monotonic clock; ledger date timestamps still use wall time.
+The three SQL integer columns truncate elapsed milliseconds; the JSON
+breakdown keeps fractional precision.
+
+Context reads start only after current message persistence or edit/regenerate
+mutations. They no longer wait for request linkage and heartbeat completion,
+but both are still awaited before generation. Diary/annotation reads overlap
+version/exact-source reads, preserving diary confirmation gates, source IDs,
+partial-range disclosure, and pointer persistence after successful assembly.
+BM25/RRF rules, revision validity checks, prompt content, and cache boundaries
+are unchanged.
 
 For chat, model usage is collected by `callModel()` and inserted once after the
 route finishes, with the complete breakdown attached. Insertion is best-effort
