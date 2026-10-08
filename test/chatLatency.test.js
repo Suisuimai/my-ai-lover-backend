@@ -18,4 +18,6 @@ test("companion chat streams visible output without a reasoning-token tax", () =
   const chat = source.slice(source.indexOf('app.post("/chat"'));
   assert.match(chat, /purpose: "companion_chat",[\s\S]*?thinking: "disabled",[\s\S]*?maxTokens: Math\.max\(1200,/);
   assert.match(chat, /onDelta: wantsStream/);
+  assert.match(chat, /recallSharedDay\(\{userId:req\.user\.id,characterId:character\.id,sessionId,message,allowSemantic:false/);
+  assert.match(chat, /settingsPromise[\s\S]*?Promise\.all\(\[[\s\S]*?heartbeatPromise/);
 });
