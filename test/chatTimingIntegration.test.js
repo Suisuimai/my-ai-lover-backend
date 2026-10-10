@@ -140,6 +140,9 @@ test("real /chat overlaps linkage and heartbeat with reads, but awaits both befo
       persisted = value;
       return new Promise(() => {});
     },
+    cachedPrefix: () => null,
+    usageTouchedCache: () => false,
+    promptCacheKeepAlive: { touch() {} },
   };
   const start = source.indexOf('app.post("/chat",');
   const end = source.indexOf("\napp.listen(", start);

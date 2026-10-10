@@ -1,6 +1,7 @@
 const { performance } = require("node:perf_hooks");
 const { createChatTiming, persistChatUsage } = require("./core/chatTiming");
 const { startChatTask } = require("./core/chatPreparation");
+const { cachedPrefix, createCacheKeepAlive, usageTouchedCache } = require("./core/cacheKeepAlive");
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
@@ -289,6 +290,20 @@ async function validatePublicConnectionUrl(value) {
   }
   return baseUrl;
 }
+
+const promptCacheKeepAlive = createCacheKeepAlive({
+  send: ({ userId, sessionId, model, temperature, prefix }) => callModel({
+    purpose: "cache_keepalive",
+    model,
+    temperature,
+    thinking: "disabled",
+    maxTokens: 1,
+    messages: [...prefix, { role: "user", content: "." }],
+    userId,
+    sessionId,
+    modelTargetPromise: getModelTarget({ userId, purpose: "companion_chat", legacyModel: model }),
+  }),
+});
 
 async function recordModelUsage(event) {
   try {
@@ -3584,6 +3599,7 @@ app.post("/chat", async (req, res) => {
   const timing = req.chatTiming || createChatTiming();
   let chatUsageEvent;
   let roundSuccess = false;
+  let keepAlivePayload = null;
   const requestStartedClock = performance.now();
   const message = typeof req.body.message === "string" ? req.body.message : "";
   if (!message.trim()) return res.status(400).json({ success: false, error: "A message is required" });
@@ -3841,6 +3857,8 @@ app.post("/chat", async (req, res) => {
         } : undefined,
         onCompletion: (value) => { modelCompletion = value; },
       });
+    const prefix = cachedPrefix(context);
+    if (prefix) keepAlivePayload = { userId: req.user.id, sessionId, model: requestedModel, temperature: settings.temperature, prefix };
 
     const generationStatus = modelCompletion.complete
       ? "complete"
@@ -4003,6 +4021,7 @@ app.post("/chat", async (req, res) => {
   } finally {
     timing.mark("round_complete", roundSuccess);
     persistChatUsage(chatUsageEvent, timing, recordModelUsage);
+    if (keepAlivePayload && usageTouchedCache(chatUsageEvent)) promptCacheKeepAlive.touch(req.user.id, keepAlivePayload);
     activeChatControllers.delete(clientRequestId);
   }
 });
