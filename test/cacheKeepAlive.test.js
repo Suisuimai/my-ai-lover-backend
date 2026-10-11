@@ -55,6 +55,16 @@ test("send failures do not stop the schedule", async () => {
   assert.equal(calls, 3);
 });
 
+test("cachedPrefix keeps layers through the last cache boundary", () => {
+  const prefix = cachedPrefix([
+    { role: "system", content: "a", cacheBoundary: true },
+    { role: "user", content: "b" },
+    { role: "assistant", content: "c", cacheBoundary: true },
+    { role: "user", content: "d" },
+  ]);
+  assert.deepEqual(prefix.map((m) => m.content), ["a", "b", "c"]);
+});
+
 test("cachedPrefix keeps layers through the cache boundary", () => {
   const prefix = cachedPrefix([
     { role: "system", content: "a" },

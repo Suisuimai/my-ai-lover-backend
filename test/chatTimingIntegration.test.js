@@ -117,7 +117,7 @@ test("real /chat overlaps linkage and heartbeat with reads, but awaits both befo
       return "";
     },
     selectRelevantPromptDocuments: () => [], selectRelevantFollowUps: () => [],
-    selectContextualFollowUps: () => [], buildModelContext: () => [], buildModelContextLayers: () => [], summarizeContextLayers: () => [],
+    selectContextualFollowUps: () => [], buildModelContext: () => [], buildModelContextLayers: () => [], summarizeContextLayers: () => [], selectConversationWindow: (messages) => ({ start: 0, messages }),
     formatPromptDocuments: () => "", formatCurrentTime: () => "",
     formatRetrievedPromptDocuments: () => "", formatCharacterProfile: () => "",
     formatUserProfile: () => "", formatWindowContinuity: () => "",

@@ -2,7 +2,7 @@ const DEFAULT_INTERVAL_MS = 55 * 60 * 1000;
 const DEFAULT_WINDOW_MS = 3 * 60 * 60 * 1000;
 
 function cachedPrefix(messages) {
-  const boundary = (messages || []).findIndex((message) => message.cacheBoundary);
+  const boundary = (messages || []).findLastIndex((message) => message.cacheBoundary);
   if (boundary < 0) return null;
   return messages.slice(0, boundary + 1).map((message) => ({ ...message }));
 }

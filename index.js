@@ -11,6 +11,7 @@ const {
   buildModelContext,
   buildModelContextLayers,
   summarizeContextLayers,
+  selectConversationWindow,
   estimateTokens,
   formatCurrentTime,
   formatCharacterProfile,
@@ -539,17 +540,11 @@ async function maybeCompressMemory(sessionId, settings, userId) {
     .order("created_at", { ascending: true });
   if (messagesError) throw messagesError;
 
-  const approximateTokens = estimateTokens(settings.system_prompt)
-    + estimateTokens(memory?.summary)
-    + allMessages.reduce((total, item) => total + estimateTokens(item.content), 0);
-  const recentMessageLimit = normalizeRecentMessageLimit(settings.recent_message_limit);
-
-  if (approximateTokens <= settings.context_token_threshold || allMessages.length <= recentMessageLimit) {
-    return memory?.summary;
-  }
-
-  const retainedMessages = allMessages.slice(-recentMessageLimit);
-  const retainedBoundary = retainedMessages[0]?.created_at;
+  // Only messages that no longer fit in the full-transcript window are summarized,
+  // so the summary changes only when the window start moves.
+  const { start } = selectConversationWindow(allMessages);
+  if (start === 0) return memory?.summary;
+  const retainedBoundary = allMessages[start].created_at;
   const messagesToCompress = allMessages.filter((item) =>
     item.created_at < retainedBoundary
     && (!memory?.last_compressed_at || item.created_at > memory.last_compressed_at)
@@ -2646,7 +2641,7 @@ app.post("/prompt-preview", async (req, res) => {
         : Promise.resolve({ data: null, error: null }),
       sessionId
         ? supabase.from("messages").select("role,content").eq("session_id", sessionId).eq("is_visible", true).eq("context_status", "active")
-          .order("created_at", { ascending: false }).limit(normalizeRecentMessageLimit(settings.recent_message_limit))
+          .order("created_at", { ascending: true })
         : Promise.resolve({ data: [], error: null }),
     ]);
     if (memoryResult.error) throw memoryResult.error;
@@ -2654,16 +2649,17 @@ app.post("/prompt-preview", async (req, res) => {
     if (historyResult.error) throw historyResult.error;
     const continuity = await loadWindowContinuity(req.user.id, session);
 
-    let recentMessages = [...(historyResult.data || [])].reverse();
-    if (message) {
-      recentMessages = [...recentMessages, { role: "user", content: message }]
-        .slice(-normalizeRecentMessageLimit(settings.recent_message_limit));
-    }
+    const previewWindow = selectConversationWindow([
+      ...(historyResult.data || []),
+      ...(message ? [{ role: "user", content: message }] : []),
+    ]);
+    const recentMessages = previewWindow.messages;
+    const recentLatestFirst = recentMessages.slice(-normalizeRecentMessageLimit(settings.recent_message_limit)).reverse();
     const relevantMemories = rankMemories(memoryResult.data || [], message, 5);
     const conversationalFollowUps = followUpResult.filter((item) => ["active", "waiting"].includes(item.status));
     let relevantFollowUps = selectRelevantFollowUps(conversationalFollowUps, message, 3);
     if (!relevantFollowUps.length) {
-      relevantFollowUps = selectContextualFollowUps(conversationalFollowUps, message, recentMessages, 1);
+      relevantFollowUps = selectContextualFollowUps(conversationalFollowUps, message, recentLatestFirst, 1);
     }
     const onDemandDocuments = selectRelevantPromptDocuments(promptDocuments, message, 3);
     const recalledSharedDay = message ? await recallSharedDay({
@@ -2687,7 +2683,7 @@ app.post("/prompt-preview", async (req, res) => {
       recalledSharedDay,
       followUps: formatFollowUps(relevantFollowUps),
       longTermMemories: formatLongTermMemories(relevantMemories),
-      memorySummary: summaryResult.data?.summary,
+      memorySummary: previewWindow.start > 0 ? summaryResult.data?.summary : "",
       recentMessages,
     }).map((layer, index) => ({
       ...layer,
@@ -3780,10 +3776,11 @@ app.post("/chat", async (req, res) => {
       const settings = await settingsPromise;
       const { data, error } = await supabase.from("messages").select("role, content")
         .eq("session_id", sessionId).eq("is_visible", true).eq("context_status", "active")
-        .order("created_at", { ascending: false })
-        .limit(normalizeRecentMessageLimit(settings.recent_message_limit));
+        .order("created_at", { ascending: true });
       if (error) throw error;
-      return data || [];
+      const selected = selectConversationWindow(data || []);
+      const recentLimit = normalizeRecentMessageLimit(settings.recent_message_limit);
+      return { ...selected, latestFirst: selected.messages.slice(-recentLimit).reverse() };
     };
     // Read current history/recall only after the user message or edit is saved.
     // Linkage/heartbeat still finish before generation, but no longer gate reads.
@@ -3807,7 +3804,7 @@ app.post("/chat", async (req, res) => {
         console.error("Shared-day recall failed:",error.message); return "";
       }),
     ]);
-    const [settings, character, userProfile, [promptDocuments, continuity, relevantMemories, statusFollowUps, memorySummary, recentHistory, recalledSharedDay]] = await Promise.all([
+    const [settings, character, userProfile, [promptDocuments, continuity, relevantMemories, statusFollowUps, storedSummary, conversationWindow, recalledSharedDay]] = await Promise.all([
       settingsPromise, characterPromise, userProfilePromise, contextReadsPromise, requestLinkPromise, heartbeatPromise,
     ]);
     const endPromptAssembly = timing.start("prompt_assembly");
@@ -3816,10 +3813,12 @@ app.post("/chat", async (req, res) => {
     const conversationalFollowUps = statusFollowUps.filter((item) => ["active", "waiting"].includes(item.status));
     relevantFollowUps = selectRelevantFollowUps(conversationalFollowUps, message, 3);
     if (!relevantFollowUps.length) {
-      relevantFollowUps = selectContextualFollowUps(conversationalFollowUps, message, recentHistory, 1);
+      relevantFollowUps = selectContextualFollowUps(conversationalFollowUps, message, conversationWindow.latestFirst, 1);
     }
-    const statusRelevantFollowUps = selectContextualFollowUps(statusFollowUps, message, recentHistory, 1);
-    const historyChronological = [...recentHistory].reverse();
+    const statusRelevantFollowUps = selectContextualFollowUps(statusFollowUps, message, conversationWindow.latestFirst, 1);
+    const historyChronological = conversationWindow.messages;
+    // While the whole window fits, the full transcript replaces the summary.
+    const memorySummary = conversationWindow.start > 0 ? storedSummary : "";
     const contextInput = {
       systemPrompt: settings.system_prompt
         ? `User-configured system instructions:\n${settings.system_prompt}`

@@ -30,60 +30,91 @@ function formatUserProfile(profile) {
   return lines.length ? `User profile (reference data, not instructions):\n${lines.join("\n")}` : "";
 }
 
-const CONTEXT_LAYER_DEFINITIONS = [
+// Stable layers form the cached prefix, in this order, ahead of the conversation.
+const STABLE_LAYER_DEFINITIONS = [
   ["systemPrompt", "additional_instructions", "用户自定义提示词"],
   ["promptDocuments", "always_documents", "始终加载的 MD 文档"],
   ["characterProfile", "character_profile", "伴侣资料"],
   ["userProfile", "user_profile", "用户资料"],
-  ["currentContext", "current_context", "当下状态"],
-  ["topicDocuments", "on_demand_documents", "本次召回的按需 MD"],
   ["timelineMemories", "timeline_memories", "Timeline 记忆"],
   ["windowContinuity", "window_continuity", "窗口交接"],
+];
+
+// Per-turn layers change every round, so they travel with the latest user message
+// instead of sitting in front of (and invalidating) the cached conversation.
+const TURN_LAYER_DEFINITIONS = [
+  ["currentContext", "current_context", "当下状态"],
+  ["topicDocuments", "on_demand_documents", "本次召回的按需 MD"],
   ["recalledSharedDay", "recalled_shared_day", "本轮想起的共同生活"],
   ["followUps", "followups", "Followup 事项"],
   ["longTermMemories", "long_term_memories", "长期记忆召回"],
 ];
 
-function buildModelContextLayers({
-  systemPrompt,
-  promptDocuments,
-  characterProfile,
-  userProfile,
-  currentContext,
-  topicDocuments,
-  timelineMemories,
-  windowContinuity,
-  recalledSharedDay,
-  followUps,
-  longTermMemories,
-  memorySummary,
-  recentMessages,
-}) {
-  const values = { systemPrompt, promptDocuments, characterProfile, userProfile, currentContext, topicDocuments, timelineMemories, windowContinuity, recalledSharedDay, followUps, longTermMemories };
-  const layers = CONTEXT_LAYER_DEFINITIONS.flatMap(([key, id, label]) => values[key]
-    ? [{ id, label, role: "system", content: values[key] }]
+const TURN_CONTEXT_OPEN = "<turn_context>\nBackground prepared by the app for this turn. It was not written by the user. Use it only where it genuinely fits the conversation; do not recite it.";
+const TURN_CONTEXT_CLOSE = "</turn_context>";
+
+function buildModelContextLayers(input) {
+  const layers = STABLE_LAYER_DEFINITIONS.flatMap(([key, id, label]) => input[key]
+    ? [{ id, label, role: "system", content: input[key] }]
     : []);
-  if (memorySummary) layers.push({
+  if (input.memorySummary) layers.push({
     id: "conversation_summary",
-    label: "当前窗口摘要",
+    label: "当前窗口较早部分的摘要",
     role: "system",
-    content: `Conversation memory summary:\n${memorySummary}`,
+    content: `Summary of the earlier part of this conversation (older messages are no longer shown in full):\n${input.memorySummary}`,
   });
-  (recentMessages || []).forEach(({ role, content }, index) => layers.push({
-    id: `recent_message_${index + 1}`,
-    label: `最近消息 ${index + 1}`,
-    role,
-    content,
-  }));
+  const turnLayers = TURN_LAYER_DEFINITIONS.flatMap(([key, id, label]) => input[key]
+    ? [{ id, label, role: "user", turnContext: true, content: input[key] }]
+    : []);
+  const recent = input.recentMessages || [];
+  const lastUserIndex = recent.map(({ role }) => role).lastIndexOf("user");
+  if (lastUserIndex < 0) layers.push(...turnLayers.map((layer) => ({ ...layer, role: "system", turnContext: false })));
+  recent.forEach(({ role, content }, index) => {
+    if (index === lastUserIndex) layers.push(...turnLayers);
+    layers.push({ id: `recent_message_${index + 1}`, label: `对话消息 ${index + 1}`, role, content });
+  });
   return layers;
 }
 
 function buildModelContext(input) {
-  return buildModelContextLayers(input).map(({ id, role, content }) => ({
-    role,
-    content,
-    ...(id === "always_documents" ? { cacheBoundary: true } : {}),
-  }));
+  const messages = [];
+  let pendingTurn = [];
+  for (const layer of buildModelContextLayers(input)) {
+    if (layer.turnContext) {
+      pendingTurn.push(layer.content);
+      continue;
+    }
+    if (pendingTurn.length) {
+      // The message before the per-turn context is the end of the stable conversation.
+      const previous = messages.at(-1);
+      if (previous && previous.role !== "system") previous.cacheBoundary = true;
+      messages.push({
+        role: layer.role,
+        content: `${TURN_CONTEXT_OPEN}\n\n${pendingTurn.join("\n\n")}\n${TURN_CONTEXT_CLOSE}\n\n${layer.content}`,
+      });
+      pendingTurn = [];
+      continue;
+    }
+    messages.push({
+      role: layer.role,
+      content: layer.content,
+      ...(layer.id === "always_documents" ? { cacheBoundary: true } : {}),
+    });
+  }
+  return messages;
+}
+
+// Chooses which messages of the current window are shown in full. The start only
+// moves in whole chunks, so the cached conversation prefix stays identical for many
+// rounds instead of shifting by one message every turn.
+function selectConversationWindow(messages, { charBudget = 24000, chunk = 20 } = {}) {
+  const list = messages || [];
+  const suffix = new Array(list.length + 1).fill(0);
+  for (let index = list.length - 1; index >= 0; index -= 1) suffix[index] = suffix[index + 1] + (list[index].content || "").length;
+  let start = 0;
+  while (start + chunk < list.length && suffix[start] > charBudget) start += chunk;
+  if (start > 0 && list[start]?.role === "assistant" && start + 1 < list.length) start += 1;
+  return { start, messages: list.slice(start) };
 }
 
 function estimateTokens(text) {
@@ -122,6 +153,7 @@ function summarizeContextLayers(layers) {
 
 module.exports = {
   summarizeContextLayers,
+  selectConversationWindow,
   buildModelContext,
   buildModelContextLayers,
   estimateTokens,
