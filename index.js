@@ -508,6 +508,19 @@ async function callModel({ model, messages, temperature, maxTokens, userId, sess
   }
 }
 
+const memoryCompressionsInFlight = new Set();
+
+// Compression only covers messages that already fell out of the recent window, so it
+// can run after the reply instead of delaying the next first token.
+function compressMemoryInBackground(sessionId, userId) {
+  if (memoryCompressionsInFlight.has(sessionId)) return;
+  memoryCompressionsInFlight.add(sessionId);
+  getSettings(userId)
+    .then((settings) => maybeCompressMemory(sessionId, settings, userId))
+    .catch(() => console.error("Memory compression failed"))
+    .finally(() => memoryCompressionsInFlight.delete(sessionId));
+}
+
 async function maybeCompressMemory(sessionId, settings, userId) {
   const { data: memory, error: memoryError } = await supabase
     .from("session_memories")
@@ -550,6 +563,7 @@ async function maybeCompressMemory(sessionId, settings, userId) {
     purpose: "conversation_summary",
     model: settings.summary_model,
     temperature: 0.2,
+    thinking: "disabled",
     maxTokens: 500,
     userId,
     messages: [{
@@ -3600,6 +3614,7 @@ app.post("/chat", async (req, res) => {
   let chatUsageEvent;
   let roundSuccess = false;
   let keepAlivePayload = null;
+  let compressionSessionId = null;
   const requestStartedClock = performance.now();
   const message = typeof req.body.message === "string" ? req.body.message : "";
   if (!message.trim()) return res.status(400).json({ success: false, error: "A message is required" });
@@ -3754,16 +3769,10 @@ app.post("/chat", async (req, res) => {
     })).catch(() => { console.error("Heartbeat timer reset failed"); });
 
     const loadMemorySummary = async () => {
-      const settings = await settingsPromise;
-      try {
-        return await maybeCompressMemory(sessionId, settings, req.user.id);
-      } catch (compressionError) {
-        console.error("Memory compression failed:", compressionError);
-        const { data: existingMemory, error: memoryError } = await supabase.from("session_memories")
-          .select("summary").eq("session_id", sessionId).maybeSingle();
-        if (memoryError) throw memoryError;
-        return existingMemory?.summary;
-      }
+      const { data: existingMemory, error: memoryError } = await supabase.from("session_memories")
+        .select("summary").eq("session_id", sessionId).maybeSingle();
+      if (memoryError) throw memoryError;
+      return existingMemory?.summary;
     };
     const loadRecentHistory = async () => {
       const settings = await settingsPromise;
@@ -3857,6 +3866,7 @@ app.post("/chat", async (req, res) => {
         } : undefined,
         onCompletion: (value) => { modelCompletion = value; },
       });
+    compressionSessionId = sessionId;
     const prefix = cachedPrefix(context);
     if (prefix) keepAlivePayload = { userId: req.user.id, sessionId, model: requestedModel, temperature: settings.temperature, prefix };
 
@@ -4021,6 +4031,7 @@ app.post("/chat", async (req, res) => {
   } finally {
     timing.mark("round_complete", roundSuccess);
     persistChatUsage(chatUsageEvent, timing, recordModelUsage);
+    if (roundSuccess && compressionSessionId) compressMemoryInBackground(compressionSessionId, req.user.id);
     if (keepAlivePayload && usageTouchedCache(chatUsageEvent)) promptCacheKeepAlive.touch(req.user.id, keepAlivePayload);
     activeChatControllers.delete(clientRequestId);
   }
