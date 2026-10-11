@@ -66,3 +66,10 @@ test("source range disclosure comes after exact messages",()=>{
   const output=formatSharedDayRecall({dayKey:"2026-09-16",diary:{body_markdown:"日记"},messages:[{role:"user",content:"原话"}],partial:true});
   assert.ok(output.indexOf("妤妤：原话")<output.indexOf("读取范围：这里只读取"));
 });
+
+test("matchedRecallPhrases merges matched bigrams into phrases from the user message", () => {
+  const { matchedRecallPhrases } = require("../core/sourceRecall");
+  assert.deepEqual(matchedRecallPhrases("今天在跑步机上听了 IELTS 听力", "那天我们聊跑步机，还有ielts"), ["跑步机", "ielts"]);
+  assert.deepEqual(matchedRecallPhrases("完全无关", "另一些文字"), []);
+  assert.equal(matchedRecallPhrases("一二三四五六七八九十", "一二 三四 五六 七八 九十 十一 二三", 3).length, 3);
+});

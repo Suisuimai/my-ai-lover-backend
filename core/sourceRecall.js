@@ -114,4 +114,32 @@ function formatSharedDayRecall({ dayKey, diary, annotations = [], messages = [],
   return blocks.join("\n\n");
 }
 
-module.exports = { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, recallSourceIds, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer };
+// Turns matched query terms back into readable phrases from the user's own message:
+// consecutive matched Chinese bigrams merge ("跑步" + "步机" -> "跑步机").
+function matchedRecallPhrases(message, evidenceText, limit = 6) {
+  const text = String(message || "").normalize("NFKC").toLowerCase();
+  const evidence = String(evidenceText || "").normalize("NFKC").toLowerCase();
+  const phrases = [];
+  for (const word of text.match(/[a-z0-9]+(?:[-_.][a-z0-9]+)*/g) || []) {
+    if (word.length >= 2 && evidence.includes(word)) phrases.push(word);
+  }
+  for (const run of text.match(/[\p{Script=Han}]+/gu) || []) {
+    let spanStart = -1;
+    for (let index = 0; index < run.length; index += 1) {
+      const matched = index < run.length - 1 && evidence.includes(run.slice(index, index + 2));
+      if (matched && spanStart < 0) spanStart = index;
+      if (!matched && spanStart >= 0) {
+        phrases.push(run.slice(spanStart, index + 1));
+        spanStart = -1;
+      }
+    }
+  }
+  return [...new Set(phrases)]
+    .map((phrase) => ({ phrase, order: text.indexOf(phrase) }))
+    .sort((left, right) => right.phrase.length - left.phrase.length || left.order - right.order)
+    .slice(0, limit)
+    .sort((left, right) => left.order - right.order)
+    .map(({ phrase }) => phrase);
+}
+
+module.exports = { matchedRecallPhrases, buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, lexicalTerms, rankSharedDays, recallSourceIds, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer };

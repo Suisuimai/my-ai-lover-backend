@@ -46,7 +46,7 @@ const { groupSourceMessagesBySharedDay, hasMorningMarker, hasNightMarker, shared
 const { buildGroundedDiaryPrompt, parseGroundedDiary, validateGroundedDiary } = require("./core/groundedDiary");
 const { applyDiaryReview, cleanText, reviewEventForAction } = require("./core/diaryReview");
 const { classifyDiaryGenerationError } = require("./core/diaryFailures");
-const { buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, rankSharedDays, recallSourceIds, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("./core/sourceRecall");
+const { matchedRecallPhrases, buildRetrievalWindows, formatSharedDayRecall, lexicalCandidateAccepted, rankSharedDays, recallSourceIds, retrievalQueryTerms, selectSourceExcerpt, shouldContinueRecallPointer } = require("./core/sourceRecall");
 const {
   buildExperienceExtractionPrompt,
   buildDocumentMergePrompt,
@@ -1843,7 +1843,7 @@ async function readVisibleMessages(sessionId, userId) {
   await requireOwnedSession(sessionId, userId);
   const { data, error } = await supabase
     .from("messages")
-    .select("id, session_id, role, content, is_visible, context_status, replaces_message_id, generation_status, finish_reason, continues_message_id, created_at")
+    .select("id, session_id, role, content, is_visible, context_status, replaces_message_id, generation_status, finish_reason, continues_message_id, recall_info, created_at")
     .eq("session_id", sessionId)
     .eq("is_visible", true)
     .order("created_at", { ascending: true });
@@ -2030,13 +2030,13 @@ async function querySourceRecallCandidates({userId,characterId,message,allowSema
   };
 }
 
-async function recallSharedDay({userId,characterId,sessionId,message,allowSemantic=true,writePointer=true,timing}) {
+async function recallSharedDay({userId,characterId,sessionId,message,allowSemantic=true,writePointer=true,timing,explain}) {
   const {terms,ranked}=await querySourceRecallCandidates({userId,characterId,message,allowSemantic,timing}); if(!terms.length)return "";
   const endAssembly = timing?.start("diary_source_assembly");
   try {
   let selected=ranked[0]||null;
   let pointer=null;
-  if(!selected&&sessionId){const {data}=await supabase.from("memory_recall_pointers").select("*").eq("session_id",sessionId).eq("user_id",userId).eq("active",true).maybeSingle();pointer=data||null;if(pointer&&shouldContinueRecallPointer(message)){selected={sharedDayId:pointer.shared_day_id,anchorSourceMessageIds:pointer.anchor_source_message_ids,score:1};}else if(pointer&&writePointer){await supabase.from("memory_recall_pointers").update({active:false,updated_at:new Date().toISOString()}).eq("session_id",sessionId).eq("user_id",userId);}}
+  if(!selected&&sessionId){const {data}=await supabase.from("memory_recall_pointers").select("*").eq("session_id",sessionId).eq("user_id",userId).eq("active",true).maybeSingle();pointer=data||null;if(pointer&&shouldContinueRecallPointer(message)){selected={sharedDayId:pointer.shared_day_id,anchorSourceMessageIds:pointer.anchor_source_message_ids,score:1,continued:true};}else if(pointer&&writePointer){await supabase.from("memory_recall_pointers").update({active:false,updated_at:new Date().toISOString()}).eq("session_id",sessionId).eq("user_id",userId);}}
   if(!selected)return "本轮自动回忆检索没有找到带有真实字面证据的旧事。不要拿仅有语义相似但尚未标定的候选猜测，也不要假装已经想起来。";
   // Diary/annotations and exact-source reads depend on different records.
   // Overlap them without changing confirmation gates or source selection.
@@ -2064,6 +2064,11 @@ async function recallSharedDay({userId,characterId,sessionId,message,allowSemant
   const byId=new Map(sourceRows.map((source)=>[source.id,source]));
   const messages=recallIds.map((id)=>byId.get(id)).filter(Boolean).map((source)=>({id:source.id,role:source.role,content:source.raw_content,occurredAt:source.source_metadata?.original_message_created_at||source.occurred_at}));
   const excerpt=selectSourceExcerpt(messages,selected.anchorSourceMessageIds,4000);
+  if(explain){
+    const anchors=new Set(selected.anchorSourceMessageIds||[]);
+    const evidence=messages.filter((item)=>anchors.has(item.id)).map((item)=>item.content).join("\n");
+    Object.assign(explain,{dayKey:day.day_key,mode:selected.continued?"continued":"matched",terms:selected.continued?[]:matchedRecallPhrases(message,evidence)});
+  }
   excerpt.partial=excerpt.partial||recallIds.length<(version.source_message_ids||[]).length;
   if(writePointer&&sessionId){await supabase.from("memory_recall_pointers").upsert({session_id:sessionId,user_id:userId,character_id:characterId,shared_day_id:selected.sharedDayId,anchor_source_message_ids:selected.anchorSourceMessageIds,pointer_label:`刚才正在谈 ${day.day_key} 的共同生活`,query_terms:terms,active:true,recalled_at:new Date().toISOString(),updated_at:new Date().toISOString()},{onConflict:"session_id"});}
   return formatSharedDayRecall({dayKey:day.day_key,diary,annotations:annotations||[],messages:excerpt.messages,partial:excerpt.partial});
@@ -3555,7 +3560,7 @@ function validUuid(value) {
 
 async function completedChatRequestResponse(request, userId) {
   const [{ data: assistant, error: assistantError }, { data: session, error: sessionError }] = await Promise.all([
-    supabase.from("messages").select("id,content,generation_status,finish_reason,continues_message_id").eq("id", request.assistant_message_id).maybeSingle(),
+    supabase.from("messages").select("id,content,generation_status,finish_reason,continues_message_id,recall_info").eq("id", request.assistant_message_id).maybeSingle(),
     supabase.from("sessions").select("id,name").eq("id", request.session_id).eq("user_id", userId).maybeSingle(),
   ]);
   if (assistantError || sessionError) throw assistantError || sessionError;
@@ -3571,6 +3576,7 @@ async function completedChatRequestResponse(request, userId) {
     generationStatus: assistant.generation_status,
     finishReason: assistant.finish_reason,
     continuesMessageId: assistant.continues_message_id,
+    recallInfo: assistant.recall_info || null,
     recovered: true,
   };
 }
@@ -3613,6 +3619,7 @@ app.post("/chat", async (req, res) => {
   let keepAlivePayload = null;
   let compressionSessionId = null;
   let contextLayerSizes = null;
+  const recallExplain = {};
   const requestStartedClock = performance.now();
   const message = typeof req.body.message === "string" ? req.body.message : "";
   if (!message.trim()) return res.status(400).json({ success: false, error: "A message is required" });
@@ -3800,7 +3807,7 @@ app.post("/chat", async (req, res) => {
       // Until BGE-M3 has a reliable calibrated threshold, semantic results are
       // unable to admit candidates on their own. Do not add ~10s of hot-path
       // work merely to reorder the same lexical days.
-      characterPromise.then((character) => recallSharedDay({userId:req.user.id,characterId:character.id,sessionId,message,allowSemantic:false,writePointer:true,timing})).catch((error)=>{
+      characterPromise.then((character) => recallSharedDay({userId:req.user.id,characterId:character.id,sessionId,message,allowSemantic:false,writePointer:true,timing,explain:recallExplain})).catch((error)=>{
         console.error("Shared-day recall failed:",error.message); return "";
       }),
     ]);
@@ -3888,6 +3895,7 @@ app.post("/chat", async (req, res) => {
         context_status: "active",
         generation_status: generationStatus,
         finish_reason: modelCompletion.finishReason,
+        recall_info: recallExplain.dayKey ? recallExplain : null,
         ...(operation === "continue" ? { continues_message_id: targetMessageId } : {}),
         ...(operation === "regenerate" ? { replaces_message_id: targetMessageId } : {}),
       })
@@ -3969,6 +3977,7 @@ app.post("/chat", async (req, res) => {
       targetMessageId: targetMessageId || null,
       generationStatus,
       finishReason: modelCompletion.finishReason,
+      recallInfo: recallExplain.dayKey ? recallExplain : null,
     };
     roundSuccess = modelCompletion.complete;
     if (wantsStream) {
