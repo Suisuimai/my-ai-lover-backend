@@ -103,7 +103,25 @@ function normalizeRecentMessageLimit(limit, fallback = 12) {
   return safeLimit % 2 === 0 ? safeLimit : safeLimit + 1;
 }
 
+// Sizes only: recent messages are collapsed into one row so no per-message data is kept.
+function summarizeContextLayers(layers) {
+  const rows = [];
+  let recent = null;
+  for (const { id, content } of layers || []) {
+    const chars = (content || "").length;
+    if (id.startsWith("recent_message_")) {
+      if (!recent) rows.push(recent = { id: "recent_messages", count: 0, chars: 0 });
+      recent.count += 1;
+      recent.chars += chars;
+    } else {
+      rows.push({ id, chars });
+    }
+  }
+  return rows;
+}
+
 module.exports = {
+  summarizeContextLayers,
   buildModelContext,
   buildModelContextLayers,
   estimateTokens,

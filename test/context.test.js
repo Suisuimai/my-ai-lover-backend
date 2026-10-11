@@ -121,3 +121,14 @@ test("recalled shared-day memory sits after handoff and before current conversat
     "recent_message_1",
   ]);
 });
+
+test("summarizeContextLayers keeps only sizes and collapses recent messages", () => {
+  const { summarizeContextLayers } = require("../core/context");
+  const rows = summarizeContextLayers([
+    { id: "always_documents", content: "abcd" },
+    { id: "recent_message_1", content: "secret one" },
+    { id: "recent_message_2", content: "two" },
+  ]);
+  assert.deepEqual(rows, [{ id: "always_documents", chars: 4 }, { id: "recent_messages", count: 2, chars: 13 }]);
+  assert.equal(JSON.stringify(rows).includes("secret"), false);
+});

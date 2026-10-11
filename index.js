@@ -10,6 +10,7 @@ const { createClient } = require("@supabase/supabase-js");
 const {
   buildModelContext,
   buildModelContextLayers,
+  summarizeContextLayers,
   estimateTokens,
   formatCurrentTime,
   formatCharacterProfile,
@@ -3615,6 +3616,7 @@ app.post("/chat", async (req, res) => {
   let roundSuccess = false;
   let keepAlivePayload = null;
   let compressionSessionId = null;
+  let contextLayerSizes = null;
   const requestStartedClock = performance.now();
   const message = typeof req.body.message === "string" ? req.body.message : "";
   if (!message.trim()) return res.status(400).json({ success: false, error: "A message is required" });
@@ -3818,7 +3820,7 @@ app.post("/chat", async (req, res) => {
     }
     const statusRelevantFollowUps = selectContextualFollowUps(statusFollowUps, message, recentHistory, 1);
     const historyChronological = [...recentHistory].reverse();
-    const context = buildModelContext({
+    const contextInput = {
       systemPrompt: settings.system_prompt
         ? `User-configured system instructions:\n${settings.system_prompt}`
         : "",
@@ -3833,7 +3835,9 @@ app.post("/chat", async (req, res) => {
       longTermMemories: formatLongTermMemories(relevantMemories),
       memorySummary,
       recentMessages: historyChronological,
-    });
+    };
+    const context = buildModelContext(contextInput);
+    contextLayerSizes = summarizeContextLayers(buildModelContextLayers(contextInput));
     if (operation === "continue") {
       context.splice(Math.max(0, context.length - historyChronological.length), 0, {
         role: "system",
@@ -4030,6 +4034,9 @@ app.post("/chat", async (req, res) => {
     res.status(cancelled ? 409 : 500).json({ success: false, error: cancelled ? "已停止生成" : "这条消息暂时没有发送成功，请重试。" });
   } finally {
     timing.mark("round_complete", roundSuccess);
+    if (chatUsageEvent && contextLayerSizes) {
+      chatUsageEvent.provider_usage = { ...(chatUsageEvent.provider_usage || {}), context_layers: contextLayerSizes };
+    }
     persistChatUsage(chatUsageEvent, timing, recordModelUsage);
     if (roundSuccess && compressionSessionId) compressMemoryInBackground(compressionSessionId, req.user.id);
     if (keepAlivePayload && usageTouchedCache(chatUsageEvent)) promptCacheKeepAlive.touch(req.user.id, keepAlivePayload);
