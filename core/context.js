@@ -104,15 +104,20 @@ function buildModelContext(input) {
   return messages;
 }
 
-// Chooses which messages of the current window are shown in full. The start only
-// moves in whole chunks, so the cached conversation prefix stays identical for many
-// rounds instead of shifting by one message every turn.
-function selectConversationWindow(messages, { charBudget = 24000, chunk = 20 } = {}) {
+// Chooses which messages of the current window are shown in full. Growth is replayed
+// message by message: once the shown part exceeds charBudget, the start jumps forward in
+// whole chunks until it is back under foldTo. The start depends only on the message
+// sequence and moves rarely, so the cached conversation prefix stays identical for many
+// rounds (each move forces a full rewrite of the conversation cache).
+function selectConversationWindow(messages, { charBudget = 24000, foldTo = 15000, chunk = 20 } = {}) {
   const list = messages || [];
-  const suffix = new Array(list.length + 1).fill(0);
-  for (let index = list.length - 1; index >= 0; index -= 1) suffix[index] = suffix[index + 1] + (list[index].content || "").length;
+  const prefix = [0];
+  for (const item of list) prefix.push(prefix.at(-1) + (item.content || "").length);
   let start = 0;
-  while (start + chunk < list.length && suffix[start] > charBudget) start += chunk;
+  for (let end = 1; end <= list.length; end += 1) {
+    if (prefix[end] - prefix[start] <= charBudget) continue;
+    while (start + chunk < end && prefix[end] - prefix[start] > foldTo) start += chunk;
+  }
   if (start > 0 && list[start]?.role === "assistant" && start + 1 < list.length) start += 1;
   return { start, messages: list.slice(start) };
 }

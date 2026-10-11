@@ -77,15 +77,22 @@ test("stable prefix is byte-identical across rounds when only per-turn context c
   assert.equal(second[4].content, "c");
 });
 
-test("selectConversationWindow keeps everything under budget and moves the start in whole chunks", () => {
-  const messages = Array.from({ length: 50 }, (_, index) => ({ role: index % 2 ? "assistant" : "user", content: "x".repeat(100) }));
-  assert.equal(selectConversationWindow(messages, { charBudget: 10000 }).start, 0);
-  const trimmed = selectConversationWindow(messages, { charBudget: 2500, chunk: 20 });
-  assert.equal(trimmed.start, 40);
-  assert.equal(trimmed.messages.length, 10);
-  const nextRound = selectConversationWindow([...messages, { role: "user", content: "x".repeat(100) }], { charBudget: 2500, chunk: 20 });
-  assert.equal(nextRound.start, 40);
-  const assistantStart = selectConversationWindow(messages.slice(1), { charBudget: 2500, chunk: 20 });
+test("selectConversationWindow keeps everything under budget and folds rarely, in whole chunks", () => {
+  const make = (length) => Array.from({ length }, (_, index) => ({ role: index % 2 ? "assistant" : "user", content: "x".repeat(100) }));
+  assert.equal(selectConversationWindow(make(50), { charBudget: 10000 }).start, 0);
+  const options = { charBudget: 2500, foldTo: 1500, chunk: 5 };
+  const starts = [];
+  for (let length = 20; length <= 60; length += 1) starts.push(selectConversationWindow(make(length), options).start);
+  // 26th message crosses 2500 chars: fold to <=1500 (chunk start 15, an assistant
+  // reply, so the shown part begins at 16); the next fold waits until the 41st message.
+  assert.equal(starts[25 - 20], 0);
+  assert.equal(starts[26 - 20], 16);
+  assert.equal(starts[40 - 20], 16);
+  assert.equal(starts[41 - 20], 30);
+  assert.ok(new Set(starts).size <= 5);
+  const trimmed = selectConversationWindow(make(60), options);
+  assert.ok(trimmed.messages.reduce((total, item) => total + item.content.length, 0) <= 2500);
+  const assistantStart = selectConversationWindow(make(27).slice(1), { ...options });
   assert.equal(assistantStart.messages[0].role, "user");
 });
 
