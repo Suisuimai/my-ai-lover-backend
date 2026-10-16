@@ -1,7 +1,14 @@
 // Temporary latency probe: measures network vs. database time from this Render region to Supabase and OpenRouter.
 const http = require("http");
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
+let KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
+async function loadPublicKey() {
+  if (KEY && KEY !== "PLACEHOLDER") return;
+  const site = "https://my-ai-lover-fronted.vercel.app";
+  const html = await (await fetch(site)).text();
+  const js = await (await fetch(site + html.match(/\/assets\/[^"]+\.js/)[0])).text();
+  KEY = js.match(/sb_publishable_[A-Za-z0-9_-]+/)[0];
+}
 
 async function timed(url, headers = {}) {
   const t0 = performance.now();
@@ -18,6 +25,7 @@ const stats = (xs) => {
 };
 
 async function probe(n) {
+  await loadPublicKey();
   const sbHeaders = { apikey: KEY, Authorization: `Bearer ${KEY}` };
   const restUrl = `${SUPABASE_URL}/rest/v1/messages?select=id&limit=1`;
   const first = await timed(restUrl, sbHeaders);
