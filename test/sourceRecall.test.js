@@ -9,14 +9,35 @@ test("lexical coordinates keep raw Chinese meaning searchable without summaries"
   assert.ok(terms.includes("morning"));
 });
 
-test("RRF combines lexical and semantic ranks without admitting semantic-only days", () => {
+test("RRF admits high-confidence semantic-only days above bypass threshold", () => {
   const ranked = rankSharedDays({
-    lexicalMatches:[{shared_day_id:"d1",source_message_id:"m1",matched_terms:3,lexical_score:8}],
-    semanticMatches:[{shared_day_id:"d2",source_message_id:"m2",similarity:.95},{shared_day_id:"d1",source_message_id:"m3",similarity:.7}],
+    lexicalMatches: [{ shared_day_id: "d1", source_message_id: "m1", matched_terms: 3, lexical_score: 8 }],
+    semanticMatches: [{ shared_day_id: "d2", source_message_id: "m2", similarity: 0.85 }, { shared_day_id: "d1", source_message_id: "m3", similarity: 0.7 }],
   });
-  assert.equal(ranked[0].sharedDayId,"d1");
-  assert.deepEqual(ranked[0].anchorSourceMessageIds,["m1"]);
-  assert.equal(ranked.some((item)=>item.sharedDayId==="d2"),false);
+  assert.equal(ranked[0].sharedDayId, "d1");
+  assert.deepEqual(ranked[0].anchorSourceMessageIds, ["m1"]);
+  assert.equal(ranked.some((item) => item.sharedDayId === "d2"), true, "high-similarity semantic-only day should be admitted");
+});
+
+test("RRF rejects low-confidence semantic-only days below bypass threshold", () => {
+  const ranked = rankSharedDays({
+    lexicalMatches: [{ shared_day_id: "d1", source_message_id: "m1", matched_terms: 3, lexical_score: 8 }],
+    semanticMatches: [{ shared_day_id: "d2", source_message_id: "m2", similarity: 0.60 }, { shared_day_id: "d1", source_message_id: "m3", similarity: 0.7 }],
+  });
+  assert.equal(ranked[0].sharedDayId, "d1");
+  assert.equal(ranked.some((item) => item.sharedDayId === "d2"), false, "low-similarity semantic-only day should be rejected");
+});
+
+test("semantic-only days anchor on their best matching window", () => {
+  const ranked = rankSharedDays({
+    lexicalMatches: [],
+    semanticMatches: [
+      { shared_day_id: "d2", source_message_ids: ["m4", "m5"], similarity: 0.82 },
+      { shared_day_id: "d2", source_message_ids: ["m9"], similarity: 0.8 },
+    ],
+  });
+  assert.equal(ranked[0].sharedDayId, "d2");
+  assert.deepEqual(ranked[0].anchorSourceMessageIds, ["m4", "m5"]);
 });
 
 test("large days disclose partial source reading", () => {

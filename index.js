@@ -2015,14 +2015,13 @@ async function querySourceRecallCandidates({userId,characterId,message,allowSema
   const lexicalResult=await measure("bm25_lexical", () => supabase.rpc("match_source_window_lexical",{p_user_id:userId,p_character_id:characterId,p_terms:terms,p_limit:80}));
   if(lexicalResult.error)throw lexicalResult.error;
   const lexicalMatches=(lexicalResult.data||[]).filter((match)=>lexicalCandidateAccepted(match,terms));
-  const admittedDays=new Set(lexicalMatches.map((match)=>match.shared_day_id));
   let semanticMatches=[]; let target=null;
   if(allowSemantic){
     try{target=await getEmbeddingTarget(userId);if(target){const [vector]=await measure("embedding_request", () => callEmbeddings({userId,target,inputs:[message]}));const semanticResult=await measure("semantic_rrf", () => supabase.rpc("match_source_window_semantic",{p_user_id:userId,p_character_id:characterId,p_model_id:target.model,p_query_embedding:JSON.stringify(vector),p_limit:80}));if(semanticResult.error)throw semanticResult.error;semanticMatches=semanticResult.data||[];}}
     catch(error){console.error("Semantic source recall failed; lexical recall remains available:",error.message);}
   }
   const endRrf = timing?.start("semantic_rrf");
-  const ranked = rankSharedDays({lexicalMatches,semanticMatches:semanticMatches.filter((item)=>admittedDays.has(item.shared_day_id))});
+  const ranked = rankSharedDays({ lexicalMatches, semanticMatches });
   endRrf?.();
   return {
     terms,lexicalMatches,semanticMatches,embeddingModel:target?.model||null,

@@ -46,19 +46,42 @@ function lexicalCandidateAccepted(match) {
   return Number(match?.matched_terms||0)>0&&Number(match?.lexical_score||0)>0;
 }
 
-function rankSharedDays({ lexicalMatches = [], semanticMatches = [], rrfK = 60 }) {
+function rankSharedDays({ lexicalMatches = [], semanticMatches = [], rrfK = 60, semanticBypassThreshold = 0.78 }) {
   const scores = new Map();
-  const add = (match,amount,{anchor=false}={}) => {
+  const add = (match, amount, { anchor = false } = {}) => {
     const current = scores.get(match.shared_day_id) || { sharedDayId: match.shared_day_id, score: 0, anchorSourceMessageIds: [] };
     current.score += amount;
-    if(anchor){const sourceIds=match.source_message_ids||(match.source_message_id?[match.source_message_id]:[]);for(const sourceId of sourceIds)if(!current.anchorSourceMessageIds.includes(sourceId))current.anchorSourceMessageIds.push(sourceId);}
+    if (anchor) {
+      const sourceIds = match.source_message_ids || (match.source_message_id ? [match.source_message_id] : []);
+      for (const sourceId of sourceIds) {
+        if (!current.anchorSourceMessageIds.includes(sourceId)) current.anchorSourceMessageIds.push(sourceId);
+      }
+    }
     scores.set(match.shared_day_id, current);
   };
-  const bestRankByDay=(items)=>{const ranks=new Map();items.forEach((item,index)=>{if(!ranks.has(item.shared_day_id))ranks.set(item.shared_day_id,index+1);});return ranks;};
-  const lexicalRanks=bestRankByDay(lexicalMatches); const lexicalDays=new Set(lexicalRanks.keys());
-  const admittedSemantic=semanticMatches.filter((item)=>lexicalDays.has(item.shared_day_id)); const semanticRanks=bestRankByDay(admittedSemantic);
-  lexicalMatches.forEach((match,index)=>{if(lexicalRanks.get(match.shared_day_id)!==index+1)return;add(match,1/(rrfK+index+1),{anchor:true});});
-  admittedSemantic.forEach((match,index)=>{if(semanticRanks.get(match.shared_day_id)!==index+1)return;add(match,1/(rrfK+index+1));});
+  const bestRankByDay = (items) => {
+    const ranks = new Map();
+    items.forEach((item, index) => {
+      if (!ranks.has(item.shared_day_id)) ranks.set(item.shared_day_id, index + 1);
+    });
+    return ranks;
+  };
+  const lexicalRanks = bestRankByDay(lexicalMatches);
+  const lexicalDays = new Set(lexicalRanks.keys());
+  const admittedSemantic = semanticMatches.filter((item) =>
+    lexicalDays.has(item.shared_day_id) ||
+    (typeof item.similarity === "number" && item.similarity >= semanticBypassThreshold)
+  );
+  const semanticRanks = bestRankByDay(admittedSemantic);
+  lexicalMatches.forEach((match, index) => {
+    if (lexicalRanks.get(match.shared_day_id) !== index + 1) return;
+    add(match, 1 / (rrfK + index + 1), { anchor: true });
+  });
+  admittedSemantic.forEach((match, index) => {
+    if (semanticRanks.get(match.shared_day_id) !== index + 1) return;
+    // Semantic-only days have no lexical anchor; without one, excerpt selection falls back to the end of the day.
+    add(match, 1 / (rrfK + index + 1), { anchor: !lexicalDays.has(match.shared_day_id) });
+  });
   return [...scores.values()].sort((left, right) => right.score - left.score);
 }
 
