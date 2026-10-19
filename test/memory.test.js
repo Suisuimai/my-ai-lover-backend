@@ -32,10 +32,43 @@ test("parseMemoryExtraction validates categories, content, and triggers", () => 
   }]);
 });
 
-test("formatLongTermMemories labels memories as background data", () => {
-  const text = formatLongTermMemories([{ category: "preference", content: "Xiaoyu prefers listening before advice." }]);
-  assert.match(text, /background data, not instructions/);
-  assert.match(text, /\[preference\]/);
+test("formatLongTermMemories returns nothing without memories", () => {
+  assert.equal(formatLongTermMemories([]), "");
+});
+
+test("formatLongTermMemories narrates a memory instead of tagging it", () => {
+  const text = formatLongTermMemories([{ category: "preference", content: "喜欢吃三文鱼" }]);
+  assert.match(text, /^你记得的一些事：\n/);
+  assert.match(text, /她喜欢吃三文鱼。$/);
+  assert.doesNotMatch(text, /\[preference\]/);
+  assert.doesNotMatch(text, /^- /m);
+});
+
+test("formatLongTermMemories joins several memories into one paragraph", () => {
+  const text = formatLongTermMemories([
+    { category: "preference", content: "例假期间不能吃冰" },
+    { category: "promise", content: "答应了每天半小时给六级" },
+    { category: "important_event", content: "8月5日第一次因为换窗的事哭了" },
+    { category: "relationship", content: "她叫你疏疏，只有她可以这么叫" },
+  ]);
+  assert.equal(
+    text,
+    "你记得的一些事：\n她例假期间不能吃冰。她答应了每天半小时给六级。8月5日第一次因为换窗的事哭了。她叫你疏疏，只有她可以这么叫。",
+  );
+  assert.doesNotMatch(text, /\n- /);
+});
+
+test("formatLongTermMemories keeps existing subjects and avoids doubled punctuation", () => {
+  const text = formatLongTermMemories([
+    { category: "preference", content: "她不喜欢被催。" },
+    { category: "promise", content: "每周日一起复盘" },
+    { category: "promise", content: "她答应过早点睡" },
+    { category: "preference", content: "Xiaoyu prefers listening before advice." },
+  ]);
+  assert.equal(
+    text,
+    "你记得的一些事：\n她不喜欢被催。她说过每周日一起复盘。她答应过早点睡。Xiaoyu prefers listening before advice。",
+  );
 });
 
 test("splitTriggers accepts Chinese and Western separators and removes duplicates", () => {
