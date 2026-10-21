@@ -2000,7 +2000,9 @@ async function buildSourceIndexBatch(userId,characterId,{includeEmbeddings=true,
 
 async function continueSourceIndexIfStarted(userId,characterId) {
   const status=await sourceIndexStatus(userId,characterId);
-  if(status.lexicalCount>0)await buildSourceIndexBatch(userId,characterId,{includeEmbeddings:status.embeddingConfigured,embeddingLimit:192});
+  // Auto-bootstrap: build index even when lexicalCount is 0, so the first diary
+  // generation automatically populates the retrieval windows without a manual call.
+  await buildSourceIndexBatch(userId,characterId,{includeEmbeddings:status.embeddingConfigured,embeddingLimit:192});
 }
 
 async function loadConfirmedDiaryForDay(userId,characterId,sharedDayId) {
@@ -2636,10 +2638,10 @@ app.post("/prompt-preview", async (req, res) => {
     const [userProfile, promptDocuments, memoryResult, followUpResult, summaryResult, historyResult] = await Promise.all([
       getOrCreateUserProfile(req.user.id),
       loadPromptDocuments(req.user.id, character.id),
-      supabase.from("memories").select("*")
-        .eq("user_id", req.user.id).eq("character_id", character.id).eq("status", "active")
-        .order("updated_at", { ascending: false }).limit(200),
-      loadStatusFollowUps(req.user.id, character.id),
+      // --- Legacy long-term memory disabled (Fix #3) ---
+      Promise.resolve({ data: [], error: null }),
+      // --- Legacy follow-ups disabled (Fix #3) ---
+      Promise.resolve([]),
       sessionId
         ? supabase.from("session_memories").select("summary").eq("session_id", sessionId).maybeSingle()
         : Promise.resolve({ data: null, error: null }),
@@ -3793,14 +3795,10 @@ app.post("/chat", async (req, res) => {
     const contextReadsPromise = Promise.all([
       characterPromise.then((character) => timing.measure("prompt_documents", () => loadPromptDocuments(req.user.id, character.id))),
       timing.measure("continuity", () => loadWindowContinuity(req.user.id, req.sessionRecord)),
-      characterPromise.then((character) => timing.measure("long_term_memories", () => recallMemories(req.user.id, character.id, message))).catch((error) => {
-        console.error("Long-term memory recall failed:", error);
-        return [];
-      }),
-      characterPromise.then((character) => timing.measure("followups", () => loadStatusFollowUps(req.user.id, character.id))).catch((error) => {
-        console.error("Follow-up recall failed:", error);
-        return [];
-      }),
+      // --- Legacy long-term memory disabled (Fix #3) — diary + source recall replaces slice-based memories ---
+      Promise.resolve([]),
+      // --- Legacy follow-ups disabled (Fix #3) — good memory makes explicit follow-up tracking redundant ---
+      Promise.resolve([]),
       settingsPromise.then(() => timing.measure("memory_summary", () => loadMemorySummary())),
       settingsPromise.then(() => timing.measure("recent_history", () => loadRecentHistory())),
       // Until BGE-M3 has a reliable calibrated threshold, semantic results are
@@ -3914,40 +3912,12 @@ app.post("/chat", async (req, res) => {
       void touchSession(sessionId, req.user.id).catch((error) => console.error("Session timestamp update failed:", error));
     }
 
-    const ruleBasedSuggestion = suggestFollowUpStatus(statusRelevantFollowUps, message);
-    const followUpStatusSuggestion = ruleBasedSuggestion
-      ? { action: "update", ...ruleBasedSuggestion }
-      : null;
-    const explicitMemory = parseExplicitMemoryRequest(message);
-    const explicitFollowUp = parseExplicitFollowUpRequest(message);
-    let capturedMemoryId = null;
-    if (explicitMemory) {
-      try {
-        const captured = await saveExplicitMemory({
-          userId: req.user.id,
-          characterId: character.id,
-          sessionId,
-          candidate: explicitMemory,
-        });
-        capturedMemoryId = captured.id;
-      } catch (memoryError) {
-        console.error("Explicit long-term memory save failed:", memoryError);
-      }
-    }
-    let followUpCapture = explicitFollowUp ? "failed" : "none";
-    if (explicitFollowUp) {
-      try {
-        await saveExplicitFollowUp({
-          userId: req.user.id,
-          characterId: character.id,
-          sessionId,
-          candidate: explicitFollowUp,
-        });
-        followUpCapture = "saved";
-      } catch (followUpError) {
-        console.error("Explicit follow-up save failed:", followUpError);
-      }
-    }
+    // --- Legacy follow-up status suggestion disabled (Fix #3) ---
+    const followUpStatusSuggestion = null;
+    // --- Legacy explicit memory + follow-up capture disabled (Fix #3) ---
+    const explicitMemory = null;
+    const capturedMemoryId = null;
+    const followUpCapture = "none";
 
     const { error: requestUpdateError } = await supabase.from("chat_requests").update({
       status: modelCompletion.complete ? "succeeded" : "truncated",
