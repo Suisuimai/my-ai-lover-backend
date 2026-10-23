@@ -5,7 +5,8 @@ const vm = require("node:vm");
 const { performance } = require("node:perf_hooks");
 const { createChatTiming, persistChatUsage } = require("../core/chatTiming");
 const { startChatTask } = require("../core/chatPreparation");
-const source = fs.readFileSync(require.resolve("../index.js"), "utf8");
+const modelSource = fs.readFileSync(require.resolve("../services/model.js"), "utf8");
+const chatRouteSource = fs.readFileSync(require.resolve("../routes/chat.js"), "utf8");
 
 test("real callModel records first delta and defers chat usage without blocking streaming", async () => {
   const timing = createChatTiming();
@@ -26,7 +27,7 @@ test("real callModel records first delta and defers chat usage without blocking 
     normalizeModelUsage: () => ({ providerUsage: { existing: 1 } }),
     recordModelUsage: () => { writes++; return new Promise(() => {}); },
   };
-  const functionSource = source.slice(source.indexOf("async function callModel("), source.indexOf("async function maybeCompressMemory("));
+  const functionSource = modelSource.slice(modelSource.indexOf("async function callModel("), modelSource.indexOf("async function createTitle("));
   const callModel = vm.runInNewContext(`${functionSource}\ncallModel`, context);
   const reply = await callModel({
     userId: "user", messages: [], timing, preparationMs: 0,
@@ -97,7 +98,7 @@ test("real /chat overlaps linkage and heartbeat with reads, but awaits both befo
     return chain;
   };
   const context = {
-    app: { post: (_, handler) => { route = handler; } },
+    router: { post: (_, handler) => { route = handler; } },
     performance, Date, AbortController, console, createChatTiming, persistChatUsage, startChatTask,
     validUuid: () => true, supabase: { from: query }, activeChatControllers: new Map(),
     requireOwnedSession: async () => ({ character_id: "character" }),
@@ -145,10 +146,10 @@ test("real /chat overlaps linkage and heartbeat with reads, but awaits both befo
     promptCacheKeepAlive: { touch() {} },
     compressMemoryInBackground: () => {},
   };
-  const start = source.indexOf('app.post("/chat",');
-  const end = source.indexOf("\napp.listen(", start);
+  const start = chatRouteSource.indexOf('router.post("/chat"');
+  const end = chatRouteSource.indexOf("\nmodule.exports", start);
   assert.ok(end > start);
-  vm.runInNewContext(source.slice(start, end), context);
+  vm.runInNewContext(chatRouteSource.slice(start, end), context);
   const timing = createChatTiming();
   timing.mark("authentication");
   const req = {
@@ -182,7 +183,7 @@ test("real callModel consumes prefetched routing once and preserves failure acco
     prepareMessagesForProvider: (messages) => messages,
     normalizeModelUsage: () => ({ providerUsage: {} }),
   };
-  const functionSource = source.slice(source.indexOf("async function callModel("), source.indexOf("async function maybeCompressMemory("));
+  const functionSource = modelSource.slice(modelSource.indexOf("async function callModel("), modelSource.indexOf("async function createTitle("));
   const callModel = vm.runInNewContext(`${functionSource}\ncallModel`, context);
   const modelTargetPromise = startChatTask(() => { throw new Error("routing failed"); });
   await new Promise((resolve) => setImmediate(resolve));
@@ -206,7 +207,7 @@ test("real callModel retains a failed usage event without leaking the thrown err
     fetch: async () => { throw new Error("sensitive transport error"); },
     normalizeModelUsage: () => ({ providerUsage: {} }),
   };
-  const functionSource = source.slice(source.indexOf("async function callModel("), source.indexOf("async function maybeCompressMemory("));
+  const functionSource = modelSource.slice(modelSource.indexOf("async function callModel("), modelSource.indexOf("async function createTitle("));
   const callModel = vm.runInNewContext(`${functionSource}\ncallModel`, context);
   await assert.rejects(callModel({
     userId: "user", messages: [], timing, onUsage: (value) => { event = value; },
@@ -241,7 +242,7 @@ test("real model usage is compatible with integer SQL columns under fractional c
     },
     normalizeModelUsage: () => ({ providerUsage: {} }),
   };
-  const functionSource = source.slice(source.indexOf("async function callModel("), source.indexOf("async function maybeCompressMemory("));
+  const functionSource = modelSource.slice(modelSource.indexOf("async function callModel("), modelSource.indexOf("async function createTitle("));
   const callModel = vm.runInNewContext(`${functionSource}\ncallModel`, context);
   await callModel({
     userId: "user", messages: [], timing, preparationMs: 12.75,

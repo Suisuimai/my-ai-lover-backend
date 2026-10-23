@@ -5,8 +5,8 @@ const vm = require("node:vm");
 const { startChatTask } = require("../core/chatPreparation");
 const { createChatTiming } = require("../core/chatTiming");
 const { recallSourceIds, selectSourceExcerpt, formatSharedDayRecall } = require("../core/sourceRecall");
-const source = fs.readFileSync(require.resolve("../index.js"), "utf8");
-const functionSource = source.slice(source.indexOf("async function recallSharedDay("), source.indexOf('app.get("/diary/shared-days"'));
+const source = fs.readFileSync(require.resolve("../services/recall.js"), "utf8");
+const functionSource = source.slice(source.indexOf("async function recallSharedDay("), source.indexOf("module.exports"));
 
 for (const scenario of [
   { name: "confirmed short day", confirmed: true },
